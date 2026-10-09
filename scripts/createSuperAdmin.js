@@ -132,7 +132,7 @@ async function createSuperAdmin() {
   console.log(`- भूमिका: SUPER_ADMIN`);
   console.log(`- स्थिति: ACTIVE`);
   console.log(`🔒 सुरक्षा सूचना: पासवर्ड सुरक्षित रूप से हैश (Bcrypt) करके संग्रहीत किया गया है।`);
-  console.log(`लॉगिन करने हेतु http://localhost:3000/login पर जाएँ।\n`);
+  console.log(`लॉगिन करने हेतु https://janconnect0.vercel.app//login पर जाएँ।\n`);
 
   await mongoose.disconnect();
   process.exit(0);
