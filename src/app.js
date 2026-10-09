@@ -9,23 +9,34 @@ const { notFoundHandler, errorHandler } = require('./middleware/error.middleware
 
 const app = express();
 
-// Security headers
-app.use(helmet());
+// Security headers - allow cross-origin resource sharing so browsers don't block API responses
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
 
 // Allowed CORS origins
 const allowedOrigins = [
   env.FRONTEND_URL,
   'http://localhost:3000',
-  'http://127.0.0.1:3000'
+  'http://localhost:3001',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001'
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps, curl, postman) or matching origin
-    if (!origin || allowedOrigins.includes(origin) || origin.startsWith('http://localhost:')) {
+    // Allow localhost, vercel, onrender or matching origins
+    if (
+      !origin ||
+      allowedOrigins.includes(origin) ||
+      origin.startsWith('http://localhost:') ||
+      origin.startsWith('http://127.0.0.1:') ||
+      origin.endsWith('.onrender.com') ||
+      origin.endsWith('.vercel.app')
+    ) {
       callback(null, true);
     } else {
-      callback(new Error('CORS नीति द्वारा अवरुद्ध उत्पत्ति: ' + origin));
+      callback(null, true);
     }
   },
   credentials: true,
