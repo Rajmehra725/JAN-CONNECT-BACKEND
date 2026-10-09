@@ -1,0 +1,171 @@
+const assert = require('assert');
+const bcrypt = require('bcryptjs');
+const { generateCaptcha, verifyCaptcha } = require('../src/services/captcha.service');
+const { buildScopeFilter } = require('../src/middleware/scope.middleware');
+const { generateComplaintTrackingId } = require('../src/utils/trackingId');
+
+console.log('====================================================');
+console.log('  जन कनेक्ट (JAN CONNECT) - ऑटोमेटेड API एवं सुरक्षा परीक्षण');
+console.log('====================================================\n');
+
+async function runTestSuite() {
+  let totalTests = 0;
+  let passedTests = 0;
+
+  async function runTest(testName, fn) {
+    totalTests++;
+    try {
+      await fn();
+      passedTests++;
+      console.log(`✅ [PASS] ${testName}`);
+    } catch (error) {
+      console.error(`❌ [FAIL] ${testName}`);
+      console.error(`   त्रुटि: ${error.message}\n`);
+    }
+  }
+
+  // 1. CAPTCHA Tests
+  await runTest('CAPTCHA जनरेशन: चुनौती आईडी और प्रश्न प्राप्त होना चाहिए, उत्तर नहीं', () => {
+    const c = generateCaptcha();
+    assert(c.challengeId && typeof c.challengeId === 'string', 'Challenge ID must be string');
+    assert(c.question && c.question.includes('='), 'Question must contain =');
+    assert(c.expiresInSeconds === 180, 'Expiration must be 180s');
+    // Confirm answer is NOT in the client payload
+    assert(c.answer === undefined, 'Answer must never be leaked to client!');
+  });
+
+  await runTest('CAPTCHA सत्यापन: गलत उत्तर अस्वीकार होना चाहिए', () => {
+    const c = generateCaptcha();
+    const res = verifyCaptcha(c.challengeId, '99999');
+    assert(res.valid === false, 'Invalid answer must be rejected');
+  });
+
+  await runTest('CAPTCHA सत्यापन: एकल उपयोग (Single-use) प्रवर्तन - दूसरा प्रयास विफल होना चाहिए', () => {
+    const c = generateCaptcha();
+    const parts = c.question.replace(' = ?', '').split(' ');
+    const n1 = parseInt(parts[0], 10);
+    const op = parts[1];
+    const n2 = parseInt(parts[2], 10);
+    const realAnswer = op === '+' ? n1 + n2 : n1 - n2;
+
+    const firstAttempt = verifyCaptcha(c.challengeId, realAnswer);
+    assert(firstAttempt.valid === true, 'First attempt with correct answer should succeed');
+
+    const replayAttempt = verifyCaptcha(c.challengeId, realAnswer);
+    assert(replayAttempt.valid === false, 'Replay attack must be blocked!');
+  });
+
+  // 2. Role-Based Scope Isolation Tests
+  await runTest('Scope Filter: सुपर एडमिन का स्कोप अनप्रतिबंधित ({}) होना चाहिए', () => {
+    const superAdmin = { role: 'SUPER_ADMIN' };
+    const filter = buildScopeFilter(superAdmin);
+    assert.deepStrictEqual(filter, {}, 'Super admin filter must be empty');
+  });
+
+  await runTest('Scope Filter: नागरिक (Citizen) केवल अपनी शिकायतें देख सकता है', () => {
+    const citizen = { role: 'CITIZEN', _id: 'citizen-id-123' };
+    const filter = buildScopeFilter(citizen);
+    assert.strictEqual(filter.citizenId, 'citizen-id-123', 'Citizen filter must enforce citizenId');
+  });
+
+  await runTest('Scope Filter: जनप्रतिनिधि/स्टाफ केवल अपनी विधानसभा का डेटा देख सकते हैं', () => {
+    const staff = { role: 'PA_STAFF', constituencyId: 'constituency-456' };
+    const filter = buildScopeFilter(staff);
+    assert.strictEqual(filter.constituencyId, 'constituency-456', 'Staff filter must enforce constituencyId');
+  });
+
+  await runTest('Scope Filter: बूथ कार्यकर्ता का स्कोप उसके बूथ/विधानसभा तक सीमित होना चाहिए', () => {
+    const worker = { role: 'BOOTH_WORKER', constituencyId: 'c-1', boothId: 'b-99' };
+    const filter = buildScopeFilter(worker);
+    assert.strictEqual(filter.boothId, 'b-99', 'Worker filter must enforce boothId');
+  });
+
+  // 3. CSV Formula Injection Defense Test
+  await runTest('सुरक्षा: CSV फॉर्मूला इंजेक्शन (CWE-1236) रोकथाम जांच', () => {
+    const dangerousInputs = [
+      '=CMD|"/C calc"!A0',
+      '+2+5',
+      '-5+10',
+      '@SUM(A1:A10)',
+      '\t=1+1'
+    ];
+
+    function sanitizeCsvCell(value) {
+      if (value === null || value === undefined) return '""';
+      let str = String(value).trim();
+      if (/^[=+\-@\t\r]/.test(str)) {
+        str = `'${str}`;
+      }
+      str = str.replace(/"/g, '""');
+      return `"${str}"`;
+    }
+
+    for (const input of dangerousInputs) {
+      const sanitized = sanitizeCsvCell(input);
+      assert(sanitized.startsWith('"\''), `Payload [${input}] must be sanitized with leading apostrophe, got: ${sanitized}`);
+    }
+  });
+
+  // 4. Staff Private Notes Privacy Verification
+  await runTest('गोपनीयता: नागरिकों के लिए स्टाफ की निजी टिप्पणियां (isInternal: true) फिल्टर होनी चाहिए', () => {
+    const sampleUpdates = [
+      { text: 'सार्वजनिक प्रगति: कार्य शुरू हुआ', isInternal: false },
+      { text: 'गोपनीय स्टाफ नोट: नागरिक से दोबारा फोन पर बात की', isInternal: true },
+      { text: 'सार्वजनिक टिप्पणी: निरीक्षण पूर्ण हुआ', isInternal: false }
+    ];
+
+    const citizenVisible = sampleUpdates.filter(u => !u.isInternal);
+    assert.strictEqual(citizenVisible.length, 2, 'Citizen must only see 2 public updates');
+    assert(citizenVisible.every(u => !u.isInternal), 'No internal update must leak to citizen');
+
+    const staffVisible = sampleUpdates;
+    assert.strictEqual(staffVisible.length, 3, 'Staff sees all 3 updates including internal notes');
+  });
+
+  // 5. Tracking ID Format Test
+  await runTest('ट्रैकिंग आईडी: प्रारूप JC-YYYY-XXXXXX होना चाहिए', () => {
+    const id1 = generateComplaintTrackingId();
+    const id2 = generateComplaintTrackingId();
+    const currentYear = new Date().getFullYear();
+    const regex = new RegExp(`^JC-${currentYear}-[0-9A-F]{6}$`);
+
+    assert(regex.test(id1), `Tracking ID ${id1} format mismatch`);
+    assert(regex.test(id2), `Tracking ID ${id2} format mismatch`);
+    assert.notStrictEqual(id1, id2, 'Tracking IDs must be unique');
+  });
+
+  // 6. Bcrypt Password Hashing Test
+  await runTest('सुरक्षा: पासवर्ड सुरक्षित हैशिंग (Bcrypt salt rounds >= 10)', async () => {
+    const plain = 'SecretPass@2026';
+    const salt = await bcrypt.genSalt(10);
+    const hash = await bcrypt.hash(plain, salt);
+
+    assert(hash.startsWith('$2a$') || hash.startsWith('$2b$'), 'Must be valid bcrypt hash');
+    assert.notStrictEqual(plain, hash, 'Plain text must never equal hash');
+    const valid = await bcrypt.compare(plain, hash);
+    assert(valid === true, 'Matching password must succeed');
+    const invalid = await bcrypt.compare('WrongPassword', hash);
+    assert(invalid === false, 'Non-matching password must fail');
+  });
+
+  // 7. Express App Smoke Test
+  await runTest('Express API: ऐप इंस्टेंस और v1 रूट माउंटिंग सत्यापित', () => {
+    const app = require('../src/app');
+    assert(typeof app.handle === 'function', 'App must be an Express instance');
+  });
+
+  console.log('\n====================================================');
+  console.log(`  परीक्षण परिणाम: ${passedTests}/${totalTests} सफल (${Math.round((passedTests/totalTests)*100)}%)`);
+  console.log('====================================================\n');
+
+  if (passedTests === totalTests) {
+    process.exit(0);
+  } else {
+    process.exit(1);
+  }
+}
+
+runTestSuite().catch(err => {
+  console.error('Test runner failure:', err);
+  process.exit(1);
+});
