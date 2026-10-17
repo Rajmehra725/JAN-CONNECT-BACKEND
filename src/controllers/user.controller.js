@@ -4,6 +4,7 @@ const User = require('../models/User');
 const { successResponse, errorResponse } = require('../utils/response');
 const { logAudit } = require('../services/audit.service');
 const { buildScopeFilter } = require('../middleware/scope.middleware');
+const { normalizePhoneNumber } = require('../utils/phone');
 
 /**
  * POST /api/v1/users
@@ -33,9 +34,9 @@ async function createUser(req, res) {
       return errorResponse(res, 'पूरा नाम, मोबाइल नंबर, पासवर्ड और भूमिका (Role) अनिवार्य हैं।', 400);
     }
 
-    const cleanMobile = String(mobileNumber).trim();
-    if (!/^\d{10}$/.test(cleanMobile)) {
-      return errorResponse(res, 'कृपया 10 अंकों का वैध मोबाइल नंबर दर्ज करें।', 400);
+    const { isValid: isPhoneValid, normalized: cleanMobile, error: phoneErr } = normalizePhoneNumber(mobileNumber);
+    if (!isPhoneValid) {
+      return errorResponse(res, phoneErr || 'कृपया 10 अंकों का वैध मोबाइल नंबर दर्ज करें।', 400);
     }
 
     // Role creation permission rules
@@ -615,8 +616,56 @@ async function getImportTemplate(req, res) {
 }
 
 /**
+ * Helper to detect Name and Phone columns in arbitrary Excel sheet
+ */
+function detectNameAndPhoneColumns(headers, customNameCol, customPhoneCol) {
+  let nameCol = customNameCol && headers.includes(customNameCol) ? customNameCol : null;
+  let phoneCol = customPhoneCol && headers.includes(customPhoneCol) ? customPhoneCol : null;
+
+  const nameCandidates = [
+    'name', 'fullname', 'full name', 'नाम', 'पूरा नाम', 'सदस्य नाम', 'सदस्य का नाम',
+    'member name', 'candidate name', 'व्यक्ति', 'citizen name', 'name of person', 'first name'
+  ];
+
+  const phoneCandidates = [
+    'phone', 'phonenumber', 'phone number', 'mobile', 'mobilenumber', 'mobile number',
+    'contact', 'contact number', 'मोबाइल', 'फ़ोन', 'फोन', 'मोबाइल नंबर', 'सम्पर्क',
+    'संपर्क', 'mobile no', 'phone no', 'contact no', 'cell', 'cell number', 'phone_number', 'mobile_number'
+  ];
+
+  if (!nameCol) {
+    nameCol = headers.find(h => {
+      const clean = String(h).trim().toLowerCase().replace(/[^a-z0-9\u0900-\u097F]/g, '');
+      return nameCandidates.some(c => clean === c.replace(/[^a-z0-9\u0900-\u097F]/g, ''));
+    }) || null;
+  }
+
+  if (!phoneCol) {
+    phoneCol = headers.find(h => {
+      const clean = String(h).trim().toLowerCase().replace(/[^a-z0-9\u0900-\u097F]/g, '');
+      return phoneCandidates.some(c => clean === c.replace(/[^a-z0-9\u0900-\u097F]/g, ''));
+    }) || null;
+  }
+
+  // Fallback: If only 2 columns exist and not matched yet
+  if (headers.length === 2) {
+    if (!nameCol && !phoneCol) {
+      nameCol = headers[0];
+      phoneCol = headers[1];
+    } else if (!nameCol) {
+      nameCol = headers.find(h => h !== phoneCol) || headers[0];
+    } else if (!phoneCol) {
+      phoneCol = headers.find(h => h !== nameCol) || headers[1];
+    }
+  }
+
+  return { nameCol, phoneCol };
+}
+
+/**
  * POST /api/v1/users/import/preview
- * Validate and preview uploaded Excel / CSV rows before importing
+ * Validate and preview uploaded Excel / CSV rows with auto header detection,
+ * manual column mapping, strict in-file and database duplicate protection.
  */
 async function previewImport(req, res) {
   try {
@@ -624,179 +673,243 @@ async function previewImport(req, res) {
       return errorResponse(res, 'कृपया एक वैध Excel (.xlsx, .xls) अथवा .csv फाइल अपलोड करें।', 400);
     }
 
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', raw: false });
     const sheetName = workbook.SheetNames[0];
     if (!sheetName) {
       return errorResponse(res, 'अपलोड की गई फाइल में कोई शीट नहीं मिली।', 400);
     }
 
-    const rawRows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
+    const worksheet = workbook.Sheets[sheetName];
+    // Use raw: false so phone numbers are preserved as strings without floating point conversion
+    const rawRows = XLSX.utils.sheet_to_json(worksheet, { raw: false, defval: '' });
     if (!rawRows || rawRows.length === 0) {
       return errorResponse(res, 'शीट में कोई डेटा पंक्ति (data row) नहीं मिली।', 400);
     }
 
-    if (rawRows.length > 2000) {
-      return errorResponse(res, 'एक समय में अधिकतम 2000 पंक्तियों का आयात किया जा सकता है।', 400);
+    if (rawRows.length > 2500) {
+      return errorResponse(res, 'एक समय में अधिकतम 2500 पंक्तियों का आयात किया जा सकता है।', 400);
     }
 
-    const incomingMobiles = rawRows
-      .map(r => String(r.mobileNumber || r['मोबाइल नंबर'] || r['Mobile'] || '').trim().replace(/^(\+91|91|0)/, '').replace(/\D/g, ''))
-      .filter(m => m.length === 10);
+    const headers = Object.keys(rawRows[0] || {});
+    const { nameColumn: customName, phoneColumn: customPhone } = req.body;
+    const { nameCol, phoneCol } = detectNameAndPhoneColumns(headers, customName, customPhone);
 
-    const existingUsers = await User.find({ mobileNumber: { $in: incomingMobiles } }).select('mobileNumber fullName role');
-    const existingMobileSet = new Set(existingUsers.map(u => u.mobileNumber));
+    // Extract all candidate phone numbers for batch database lookup
+    const rawPhoneValues = rawRows.map(r => r[phoneCol || 'mobileNumber'] || r[headers[1]] || '');
+    const candidateMobiles = [];
+    rawPhoneValues.forEach(val => {
+      const { isValid, normalized } = normalizePhoneNumber(val);
+      if (isValid && !candidateMobiles.includes(normalized)) {
+        candidateMobiles.push(normalized);
+      }
+    });
 
-    const seenInFile = new Set();
+    const existingUsers = await User.find({ mobileNumber: { $in: candidateMobiles } })
+      .select('mobileNumber fullName role accountStatus');
+    const existingMobileMap = new Map();
+    existingUsers.forEach(u => {
+      existingMobileMap.set(u.mobileNumber, {
+        fullName: u.fullName,
+        role: u.role,
+        accountStatus: u.accountStatus
+      });
+    });
+
+    const seenInFile = new Map(); // mobileNumber -> firstRowNumber
     const validatedRows = [];
-    const errors = [];
-    const allowedRoles = ['CITIZEN', 'BOOTH_WORKER', 'PA_STAFF', 'POLITICIAN'];
+    const errorList = [];
 
     rawRows.forEach((row, idx) => {
-      const rowNum = idx + 2;
-      const fullName = String(row.fullName || row['पूरा नाम'] || row['Name'] || '').trim();
-      const rawMobile = String(row.mobileNumber || row['मोबाइल नंबर'] || row['Mobile'] || '').trim();
-      const cleanMobile = rawMobile.replace(/^(\+91|91|0)/, '').replace(/\D/g, '');
-      const rawRole = String(row.role || row['भूमिका'] || row['Role'] || 'CITIZEN').trim().toUpperCase();
+      const rowNum = idx + 2; // Row number in sheet (1-based + 1 header)
+
+      // Extract Name (Hindi and English)
+      const rawName = nameCol ? String(row[nameCol] || '').trim() : String(row.fullName || row.Name || row['नाम'] || Object.values(row)[0] || '').trim();
+
+      // Extract Phone Number
+      const rawPhone = phoneCol ? row[phoneCol] : (row.mobileNumber || row.Phone || row['मोबाइल'] || Object.values(row)[1] || '');
+
+      const { isValid: isPhoneValid, normalized: cleanMobile, error: phoneErr } = normalizePhoneNumber(rawPhone);
 
       const rowErrors = [];
 
-      if (!fullName) {
-        rowErrors.push('नाम अनिवार्य है');
-      }
-      if (!cleanMobile || cleanMobile.length !== 10) {
-        rowErrors.push('10 अंकों का वैध मोबाइल नंबर अनिवार्य है');
-      }
-      if (rawRole === 'SUPER_ADMIN') {
-        rowErrors.push('सुरक्षा कारणों से एक्सेल से सुपर एडमिन आयात की अनुमति नहीं है');
-      } else if (!allowedRoles.includes(rawRole)) {
-        rowErrors.push(`अमान्य भूमिका [${rawRole}]। मान्य: CITIZEN, BOOTH_WORKER, PA_STAFF, POLITICIAN`);
+      // 1. Validate Name
+      if (!rawName || rawName.length < 2) {
+        rowErrors.push('नाम अनिवार्य है (कम से कम 2 अक्षर)');
       }
 
-      const isDuplicateInFile = cleanMobile && seenInFile.has(cleanMobile);
-      if (isDuplicateInFile) {
-        rowErrors.push('यह मोबाइल नंबर इसी फाइल में दोहराया गया है');
-      } else if (cleanMobile) {
-        seenInFile.add(cleanMobile);
+      // 2. Validate Phone
+      if (!isPhoneValid) {
+        rowErrors.push(phoneErr || '10 अंकों का वैध भारतीय मोबाइल नंबर अनिवार्य है');
       }
 
-      const isExistingInDb = cleanMobile && existingMobileSet.has(cleanMobile);
+      // 3. Strict In-File Duplicate Checking
+      let isDuplicateInFile = false;
+      let duplicateOfRow = null;
+      if (isPhoneValid && cleanMobile) {
+        if (seenInFile.has(cleanMobile)) {
+          isDuplicateInFile = true;
+          duplicateOfRow = seenInFile.get(cleanMobile);
+          rowErrors.push(`फाइल में दोहराया गया मोबाइल नंबर (पंक्ति ${duplicateOfRow} पर पहले से मौजूद)`);
+        } else {
+          seenInFile.set(cleanMobile, rowNum);
+        }
+      }
+
+      // 4. Strict Database Duplicate Checking
+      let isExistingInDb = false;
+      let existingRecord = null;
+      if (isPhoneValid && cleanMobile && existingMobileMap.has(cleanMobile)) {
+        isExistingInDb = true;
+        existingRecord = existingMobileMap.get(cleanMobile);
+      }
+
+      const isValid = rowErrors.length === 0;
 
       const parsedRow = {
         rowNumber: rowNum,
-        fullName,
-        mobileNumber: cleanMobile,
-        role: rawRole || 'CITIZEN',
-        designation: String(row.designation || row['पदनाम'] || '').trim(),
-        voterId: String(row.voterId || row['मतदाता पहचान'] || '').trim().toUpperCase(),
-        gender: ['MALE', 'FEMALE', 'OTHER'].includes(String(row.gender || row['लिंग'] || '').toUpperCase()) ? String(row.gender).toUpperCase() : undefined,
-        email: String(row.email || row['ईमेल'] || '').trim().toLowerCase() || undefined,
-        district: String(row.district || row['जिला'] || '').trim(),
-        assemblyConstituency: String(row.assemblyConstituency || row['विधानसभा'] || '').trim(),
-        wardNumber: String(row.wardNumber || row['वार्ड'] || '').trim(),
-        boothNumber: String(row.boothNumber || row['बूथ'] || '').trim(),
-        address: String(row.address || row['पता'] || '').trim(),
-        pincode: String(row.pincode || row['पिनकोड'] || '').trim(),
+        fullName: rawName,
+        mobileNumber: cleanMobile || String(rawPhone || '').trim(),
+        rawMobile: String(rawPhone || ''),
+        role: 'CITIZEN', // STRICT: Default role is always CITIZEN
+        isValid,
+        isDuplicateInFile,
+        duplicateOfRow,
         isExistingInDb,
-        isValid: rowErrors.length === 0,
+        existingRecord,
         errors: rowErrors
       };
 
-      if (rowErrors.length > 0) {
-        errors.push({ rowNumber: rowNum, errors: rowErrors });
+      if (!isValid || isExistingInDb) {
+        errorList.push({
+          rowNumber: rowNum,
+          name: rawName,
+          mobile: cleanMobile || String(rawPhone || '').trim(),
+          reason: isExistingInDb
+            ? `डेटाबेस में पहले से पंजीकृत (${existingRecord?.fullName} - ${existingRecord?.role})`
+            : rowErrors.join(', ')
+        });
       }
 
       validatedRows.push(parsedRow);
     });
 
-    const validCount = validatedRows.filter(r => r.isValid && !r.isExistingInDb).length;
-    const existingCount = validatedRows.filter(r => r.isValid && r.isExistingInDb).length;
-    const invalidCount = validatedRows.filter(r => !r.isValid).length;
+    const validRowsCount = validatedRows.filter(r => r.isValid && !r.isExistingInDb).length;
+    const duplicateInFileCount = validatedRows.filter(r => r.isDuplicateInFile).length;
+    const existingInDbCount = validatedRows.filter(r => r.isExistingInDb && !r.isDuplicateInFile).length;
+    const invalidCount = validatedRows.filter(r => !r.isValid && !r.isDuplicateInFile).length;
 
     return successResponse(res, {
+      headers,
+      detectedMapping: {
+        nameColumn: nameCol || headers[0] || 'Name',
+        phoneColumn: phoneCol || headers[1] || 'Phone Number'
+      },
       totalRows: rawRows.length,
-      validRows: validCount,
-      existingRows: existingCount,
+      validRows: validRowsCount,
+      duplicateInFileRows: duplicateInFileCount,
+      existingInDbRows: existingInDbCount,
       invalidRows: invalidCount,
-      preview: validatedRows.slice(0, 15),
-      errors: errors.slice(0, 50)
-    }, 'आयात पूर्वावलोकन तैयार है।');
+      preview: validatedRows.slice(0, 25),
+      rows: validatedRows,
+      errors: errorList
+    }, 'एक्सेल आयात पूर्वावलोकन सफलतापूर्वक तैयार हुआ।');
   } catch (error) {
-    return errorResponse(res, `फ़ाइल पार्स करने में त्रुटि: ${error.message}`, 500);
+    return errorResponse(res, `एक्सेल फ़ाइल पार्स करने में त्रुटि: ${error.message}`, 500);
   }
 }
 
 /**
  * POST /api/v1/users/import/confirm
- * Execute validated bulk import with optional updateExisting flag
+ * Safely batch import valid members from Excel with strict CITIZEN default role
+ * and zero-overwriting of existing database records.
  */
 async function confirmImport(req, res) {
   try {
-    const { rows, updateExisting = false } = req.body;
+    const { rows, skipExisting = true } = req.body;
     if (!Array.isArray(rows) || rows.length === 0) {
-      return errorResponse(res, 'आयात करने के लिए कोई मान्य पंक्ति प्राप्त नहीं हुई।', 400);
+      return errorResponse(res, 'आयात करने के लिए कोई पंक्ति प्राप्त नहीं हुई।', 400);
     }
 
-    if (rows.length > 2000) {
-      return errorResponse(res, 'अधिकतम 2000 पंक्तियों का बैच समर्थित है।', 400);
+    if (rows.length > 2500) {
+      return errorResponse(res, 'अधिकतम 2500 पंक्तियों का बैच समर्थित है।', 400);
+    }
+
+    // Role check: Only SUPER_ADMIN (or permitted staff) can perform import
+    if (req.user.role !== 'SUPER_ADMIN') {
+      return errorResponse(res, 'केवल सुपर एडमिन को एक्सेल आयात करने की अनुमति है।', 403);
     }
 
     const salt = await bcrypt.genSalt(10);
-    const defaultPasswordHash = await bcrypt.hash('Member@123#', salt);
+    const defaultPasswordHash = await bcrypt.hash('Citizen@2026#', salt);
 
     let createdCount = 0;
-    let updatedCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
     const failureList = [];
 
-    for (const r of rows) {
-      const cleanMobile = String(r.mobileNumber || '').trim();
-      if (!cleanMobile || cleanMobile.length !== 10) {
-        skippedCount++;
-        failureList.push({ rowNumber: r.rowNumber, mobile: cleanMobile, reason: 'अमान्य मोबाइल नंबर' });
-        continue;
-      }
+    // Filter to rows that have valid phone and name
+    const validRows = rows.filter(r => r.isValid && !r.isDuplicateInFile);
 
-      const existing = await User.findOne({ mobileNumber: cleanMobile });
+    // Collect all candidate clean mobiles
+    const mobilesToCheck = validRows.map(r => r.mobileNumber).filter(Boolean);
+    const existingUsers = await User.find({ mobileNumber: { $in: mobilesToCheck } }).select('mobileNumber fullName role');
+    const existingMobileSet = new Set(existingUsers.map(u => u.mobileNumber));
 
-      if (existing) {
-        if (updateExisting) {
-          if (r.fullName) existing.fullName = r.fullName.trim();
-          if (r.designation !== undefined) existing.designation = r.designation.trim();
-          if (r.voterId !== undefined) existing.voterId = r.voterId.trim();
-          if (r.gender) existing.gender = r.gender;
-          if (r.email) existing.email = r.email.trim().toLowerCase();
-          if (r.district) existing.district = r.district.trim();
-          if (r.assemblyConstituency) existing.assemblyConstituency = r.assemblyConstituency.trim();
-          if (r.wardNumber) existing.wardNumber = r.wardNumber.trim();
-          if (r.boothNumber) existing.boothNumber = r.boothNumber.trim();
-          if (r.address) existing.address = r.address.trim();
-          if (r.pincode) existing.pincode = r.pincode.trim();
-          await existing.save();
-          updatedCount++;
-        } else {
+    // Batch insert new records in chunks of 100
+    const CHUNK_SIZE = 100;
+    for (let i = 0; i < validRows.length; i += CHUNK_SIZE) {
+      const chunk = validRows.slice(i, i + CHUNK_SIZE);
+      const toInsert = [];
+
+      for (const r of chunk) {
+        const cleanMobile = r.mobileNumber;
+
+        // Strict duplicate check against database: skip by default
+        if (existingMobileSet.has(cleanMobile)) {
           skippedCount++;
+          failureList.push({
+            rowNumber: r.rowNumber,
+            name: r.fullName,
+            mobile: cleanMobile,
+            reason: 'डेटाबेस में पहले से पंजीकृत सदस्य (स्किप किया गया)'
+          });
+          continue;
         }
-      } else {
-        const newUser = new User({
-          fullName: r.fullName ? r.fullName.trim() : 'सदस्य',
+
+        toInsert.push({
+          fullName: r.fullName ? String(r.fullName).trim() : 'नागरिक',
           mobileNumber: cleanMobile,
           passwordHash: defaultPasswordHash,
-          role: ['CITIZEN', 'BOOTH_WORKER', 'PA_STAFF', 'POLITICIAN'].includes(r.role) ? r.role : 'CITIZEN',
+          role: 'CITIZEN', // STRICT: Always CITIZEN for imported spreadsheets
           accountStatus: 'ACTIVE',
-          designation: r.designation ? r.designation.trim() : '',
-          voterId: r.voterId ? r.voterId.trim() : '',
-          gender: r.gender,
-          email: r.email,
-          district: r.district,
-          assemblyConstituency: r.assemblyConstituency,
-          wardNumber: r.wardNumber,
-          boothNumber: r.boothNumber,
-          address: r.address,
-          pincode: r.pincode,
           createdBy: req.user._id
         });
-        await newUser.save();
-        createdCount++;
+      }
+
+      if (toInsert.length > 0) {
+        try {
+          const insertRes = await User.insertMany(toInsert, { ordered: false });
+          createdCount += insertRes.length;
+        } catch (err) {
+          // Handle E11000 duplicate key error in chunk gracefully
+          if (err.writeErrors) {
+            createdCount += (toInsert.length - err.writeErrors.length);
+            err.writeErrors.forEach(we => {
+              failedCount++;
+              failureList.push({
+                rowNumber: 0,
+                mobile: we.errmsg,
+                reason: 'डुप्लीकेट मोबाइल नंबर (E11000)'
+              });
+            });
+          } else {
+            failedCount += toInsert.length;
+            failureList.push({
+              rowNumber: 0,
+              reason: err.message
+            });
+          }
+        }
       }
     }
 
@@ -808,17 +921,49 @@ async function confirmImport(req, res) {
       resourceId: req.user._id,
       ipAddress: req.ip,
       userAgent: req.get('user-agent'),
-      details: { created: createdCount, updated: updatedCount, skipped: skippedCount }
+      details: { created: createdCount, skipped: skippedCount, failed: failedCount }
     });
 
     return successResponse(res, {
-      created: createdCount,
-      updated: updatedCount,
-      skipped: skippedCount,
+      totalProcessed: validRows.length,
+      createdCount,
+      skippedCount,
+      failedCount,
       failures: failureList
-    }, `एक्सेल आयात संपन्न: ${createdCount} नए सदस्य निर्मित, ${updatedCount} अद्यतन, ${skippedCount} छोड़े गए।`);
+    }, `एक्सेल आयात संपन्न: ${createdCount} नए नागरिक सफलतापूर्वक पंजीकृत हुए, ${skippedCount} डुप्लीकेट छोड़े गए।`);
   } catch (error) {
     return errorResponse(res, `आयात प्रक्रिया में त्रुटि: ${error.message}`, 500);
+  }
+}
+
+/**
+ * POST /api/v1/users/import/error-report
+ * Download an Excel file of skipped / failed rows
+ */
+async function exportImportErrorReport(req, res) {
+  try {
+    const { errors = [] } = req.body;
+    if (!Array.isArray(errors) || errors.length === 0) {
+      return errorResponse(res, 'डाउनलोड हेतु कोई त्रुटि रिकॉर्ड नहीं मिला।', 400);
+    }
+
+    const data = errors.map(e => ({
+      'पंक्ति क्रमांक (Row)': e.rowNumber || '—',
+      'नाम (Name)': sanitizeCell(e.name || ''),
+      'मोबाइल नंबर (Mobile)': sanitizeCell(e.mobile || ''),
+      'अस्वीकृति / स्किप का कारण (Reason)': sanitizeCell(e.reason || e.error || '')
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(data);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Import Errors');
+
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="jan-connect-import-errors-${Date.now()}.xlsx"`);
+    return res.status(200).send(buffer);
+  } catch (error) {
+    return errorResponse(res, `त्रुटि रिपोर्ट जनरेट करने में विफलता: ${error.message}`, 500);
   }
 }
 
@@ -832,5 +977,6 @@ module.exports = {
   exportUsers,
   getImportTemplate,
   previewImport,
-  confirmImport
+  confirmImport,
+  exportImportErrorReport
 };

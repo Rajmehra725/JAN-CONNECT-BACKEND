@@ -156,6 +156,24 @@ const userSchema = new mongoose.Schema(
   }
 );
 
+// Automatic phone number normalization before schema validation
+const { normalizePhoneNumber } = require('../utils/phone');
+
+userSchema.pre('validate', function () {
+  if (this.mobileNumber) {
+    const { isValid, normalized } = normalizePhoneNumber(this.mobileNumber);
+    if (isValid) {
+      this.mobileNumber = normalized;
+    }
+  }
+  if (this.alternateMobile) {
+    const { isValid, normalized } = normalizePhoneNumber(this.alternateMobile);
+    if (isValid) {
+      this.alternateMobile = normalized;
+    }
+  }
+});
+
 // Safe JSON serialization to ensure passwordHash is never returned
 userSchema.methods.toJSON = function () {
   const obj = this.toObject();

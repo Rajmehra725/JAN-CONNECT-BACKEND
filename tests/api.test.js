@@ -148,7 +148,37 @@ async function runTestSuite() {
     assert(invalid === false, 'Non-matching password must fail');
   });
 
-  // 7. Express App Smoke Test
+  // 7. Phone Normalization & Canonical Identity Tests
+  const { normalizePhoneNumber } = require('../src/utils/phone');
+  await runTest('फोन सत्यापन: सामान्य 10 अंक (+91, 0, स्पेस और हाइफन) शुद्ध होने चाहिए', () => {
+    const t1 = normalizePhoneNumber('+91 98930 01122');
+    assert.strictEqual(t1.isValid, true);
+    assert.strictEqual(t1.normalized, '9893001122');
+
+    const t2 = normalizePhoneNumber('09893001122');
+    assert.strictEqual(t2.isValid, true);
+    assert.strictEqual(t2.normalized, '9893001122');
+
+    const t3 = normalizePhoneNumber('91-9893001122');
+    assert.strictEqual(t3.isValid, true);
+    assert.strictEqual(t3.normalized, '9893001122');
+  });
+
+  await runTest('फोन सत्यापन: वैज्ञानिक संकेतन (Scientific Notation e.g. 9.893E+09) सुरक्षित पूर्णांक बनना चाहिए', () => {
+    const sci = normalizePhoneNumber('9.893001122e+09');
+    assert.strictEqual(sci.isValid, true);
+    assert.strictEqual(sci.normalized, '9893001122');
+  });
+
+  await runTest('फोन सत्यापन: अमान्य फोन नंबर (कम अंक या गैर-भारतीय अंक) अस्वीकार होने चाहिए', () => {
+    const shortNum = normalizePhoneNumber('989300');
+    assert.strictEqual(shortNum.isValid, false);
+
+    const nonIndian = normalizePhoneNumber('1234567890');
+    assert.strictEqual(nonIndian.isValid, false);
+  });
+
+  // 8. Express App Smoke Test
   await runTest('Express API: ऐप इंस्टेंस और v1 रूट माउंटिंग सत्यापित', () => {
     const app = require('../src/app');
     assert(typeof app.handle === 'function', 'App must be an Express instance');

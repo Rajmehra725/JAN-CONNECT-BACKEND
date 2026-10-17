@@ -40,6 +40,13 @@ router.post(
   userController.confirmImport
 );
 
+router.post(
+  '/import/error-report',
+  authenticate,
+  requireRoles('SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF'),
+  userController.exportImportErrorReport
+);
+
 // Protected user management routes
 router.post(
   '/',
