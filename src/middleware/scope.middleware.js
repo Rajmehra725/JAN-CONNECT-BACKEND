@@ -9,6 +9,25 @@ function buildScopeFilter(user, mapping = {}) {
     return {};
   }
 
+  // If querying users directory directly
+  if (mapping.isUserQuery) {
+    if (user.role === "CITIZEN") {
+      return { _id: user._id };
+    }
+    if (user.role === "BOOTH_WORKER") {
+      if (user.boothId) {
+        return { $or: [{ boothId: user.boothId }, { _id: user._id }] };
+      }
+      return { _id: user._id };
+    }
+    if (user.role === "POLITICIAN" || user.role === "PA_STAFF") {
+      if (user.constituencyId) {
+        return { constituencyId: user.constituencyId };
+      }
+      return { _id: user._id };
+    }
+  }
+
   // Citizens can only view/query their own records
   if (user.role === "CITIZEN") {
     const citizenField = mapping.citizenField || "citizenId";

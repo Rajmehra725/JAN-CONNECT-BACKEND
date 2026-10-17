@@ -106,6 +106,11 @@ const complaintSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    rejectionReason: {
+      type: String,
+      trim: true,
+      default: "",
+    },
   },
   { timestamps: true }
 );

@@ -1,3 +1,4 @@
+const XLSX = require('xlsx');
 const Complaint = require('../models/Complaint');
 const User = require('../models/User');
 const Task = require('../models/Task');
@@ -7,27 +8,25 @@ const { buildScopeFilter } = require('../middleware/scope.middleware');
 
 /**
  * Sanitize cell value to prevent CSV Formula Injection (CWE-1236)
- * When a cell starts with =, +, -, @, \t, or \r, prefix with a single quote '
  */
 function sanitizeCsvCell(value) {
-  if (value === null || value === undefined) return '""';
+  if (value === null || value === undefined) return '';
   let str = String(value).trim();
-  // If starts with dangerous character, escape with single quote
   if (/^[=+\-@\t\r]/.test(str)) {
     str = `'${str}`;
   }
-  // Escape double quotes
-  str = str.replace(/"/g, '""');
-  return `"${str}"`;
+  return str;
 }
 
 /**
  * GET /api/v1/reports/summary
- * Constituency / Role-based operational overview metrics
+ * Platform-wide / Constituency / Role-based operational overview metrics
  */
 async function getDashboardSummary(req, res) {
   try {
     const scopeFilter = buildScopeFilter(req.user);
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
 
     // Complaint aggregation
     const [
@@ -35,29 +34,38 @@ async function getDashboardSummary(req, res) {
       resolvedComplaints,
       inProgressComplaints,
       submittedComplaints,
-      urgentComplaints
+      rejectedComplaints,
+      urgentComplaints,
+      todayComplaints
     ] = await Promise.all([
       Complaint.countDocuments(scopeFilter),
       Complaint.countDocuments({ ...scopeFilter, status: 'RESOLVED' }),
       Complaint.countDocuments({ ...scopeFilter, status: { $in: ['IN_PROGRESS', 'ASSIGNED', 'UNDER_REVIEW'] } }),
       Complaint.countDocuments({ ...scopeFilter, status: 'SUBMITTED' }),
-      Complaint.countDocuments({ ...scopeFilter, priority: 'URGENT', status: { $ne: 'RESOLVED' } })
+      Complaint.countDocuments({ ...scopeFilter, status: 'REJECTED' }),
+      Complaint.countDocuments({ ...scopeFilter, priority: 'URGENT', status: { $ne: 'RESOLVED' } }),
+      Complaint.countDocuments({ ...scopeFilter, createdAt: { $gte: startOfToday } })
     ]);
 
     // User aggregation
-    let userFilter = {};
-    if (req.user.role !== 'SUPER_ADMIN' && req.user.constituencyId) {
-      userFilter.constituencyId = req.user.constituencyId;
-    }
+    let userFilter = buildScopeFilter(req.user, { isUserQuery: true });
 
     const [
+      totalUsers,
       totalCitizens,
       totalBoothWorkers,
-      totalStaff
+      totalStaff,
+      totalPoliticians,
+      totalSuperAdmins,
+      todayRegistrations
     ] = await Promise.all([
+      User.countDocuments(userFilter),
       User.countDocuments({ ...userFilter, role: 'CITIZEN' }),
       User.countDocuments({ ...userFilter, role: 'BOOTH_WORKER' }),
-      User.countDocuments({ ...userFilter, role: 'PA_STAFF' })
+      User.countDocuments({ ...userFilter, role: 'PA_STAFF' }),
+      User.countDocuments({ ...userFilter, role: 'POLITICIAN' }),
+      User.countDocuments({ ...userFilter, role: 'SUPER_ADMIN' }),
+      User.countDocuments({ ...userFilter, createdAt: { $gte: startOfToday } })
     ]);
 
     // Task aggregation
@@ -78,25 +86,72 @@ async function getDashboardSummary(req, res) {
     const todayStr = new Date().toISOString().split('T')[0];
     const todayAttendanceCount = await Attendance.countDocuments({ attendanceDate: todayStr });
 
+    // Recent 5 member registrations
+    const recentMembers = await User.find(userFilter)
+      .select('fullName mobileNumber role accountStatus createdAt designation district assemblyConstituency')
+      .sort({ createdAt: -1 })
+      .limit(5);
+
+    // Recent 5 complaints
+    const recentComplaints = await Complaint.find(scopeFilter)
+      .populate('citizenId', 'fullName mobileNumber')
+      .select('trackingId subject category priority status createdAt')
+      .sort({ createdAt: -1 })
+      .limit(5);
+
+    // 7-day activity trend for charts
+    const trend = [];
+    for (let i = 6; i >= 0; i--) {
+      const dayStart = new Date();
+      dayStart.setDate(dayStart.getDate() - i);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(dayStart);
+      dayEnd.setHours(23, 59, 59, 999);
+      const dateLabel = dayStart.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
+
+      const [regCount, compCount] = await Promise.all([
+        User.countDocuments({ ...userFilter, createdAt: { $gte: dayStart, $lte: dayEnd } }),
+        Complaint.countDocuments({ ...scopeFilter, createdAt: { $gte: dayStart, $lte: dayEnd } })
+      ]);
+
+      trend.push({
+        date: dateLabel,
+        registrations: regCount,
+        complaints: compCount
+      });
+    }
+
+    const resolutionRate = totalComplaints > 0 ? Math.round((resolvedComplaints / totalComplaints) * 100) : 0;
+
     return successResponse(res, {
       complaints: {
         total: totalComplaints,
         submitted: submittedComplaints,
         inProgress: inProgressComplaints,
         resolved: resolvedComplaints,
-        urgent: urgentComplaints
+        rejected: rejectedComplaints,
+        urgent: urgentComplaints,
+        todayComplaints,
+        resolutionRate
       },
       users: {
+        total: totalUsers,
         citizens: totalCitizens,
         boothWorkers: totalBoothWorkers,
-        staff: totalStaff
+        staff: totalStaff,
+        politicians: totalPoliticians,
+        superAdmins: totalSuperAdmins,
+        todayRegistrations
       },
       tasks: {
         total: totalTasks,
         completed: completedTasks,
         pending: pendingTasks
       },
-      todayAttendance: todayAttendanceCount
+      todayAttendance: todayAttendanceCount,
+      recentMembers: recentMembers.map(u => u.toJSON()),
+      recentComplaints,
+      trend
     }, 'डैशबोर्ड सांख्यिकी प्राप्त हुई।');
   } catch (error) {
     return errorResponse(res, `सांख्यिकी गणना में त्रुटि: ${error.message}`, 500);
@@ -105,54 +160,67 @@ async function getDashboardSummary(req, res) {
 
 /**
  * GET /api/v1/reports/export/complaints
- * Stream sanitized CSV export with formula injection protection
+ * Stream sanitized CSV or Excel export with formula injection protection
  */
 async function exportComplaintsCsv(req, res) {
   try {
-    const scopeFilter = buildScopeFilter(req.user);
+    const { status, category, priority, search, format = 'csv' } = req.query;
+    let scopeFilter = buildScopeFilter(req.user);
+
+    if (status && status !== 'ALL') scopeFilter.status = status;
+    if (category && category !== 'ALL') scopeFilter.category = category;
+    if (priority && priority !== 'ALL') scopeFilter.priority = priority;
+    if (search && search.trim()) {
+      const regex = new RegExp(search.trim(), 'i');
+      scopeFilter.$or = [
+        { trackingId: regex },
+        { subject: regex },
+        { description: regex }
+      ];
+    }
+
     const complaints = await Complaint.find(scopeFilter)
-      .populate('citizenId', 'fullName mobileNumber')
+      .populate('citizenId', 'fullName mobileNumber email')
       .populate('constituencyId', 'name')
-      .populate('wardId', 'wardNumber')
-      .populate('boothId', 'boothNumber')
+      .populate('wardId', 'name wardNumber')
+      .populate('boothId', 'name boothNumber')
+      .populate('assignedUserId', 'fullName role')
       .sort({ createdAt: -1 })
-      .limit(1000);
+      .limit(5000);
 
-    const headers = [
-      'Tracking ID',
-      'Citizen Name',
-      'Mobile',
-      'Category',
-      'Subject',
-      'Priority',
-      'Status',
-      'Constituency',
-      'Ward',
-      'Booth',
-      'Date Submitted'
-    ];
+    const rows = complaints.map(c => ({
+      'ट्रैकिंग ID (Tracking ID)': sanitizeCsvCell(c.trackingId),
+      'नागरिक का नाम (Citizen Name)': sanitizeCsvCell(c.citizenId?.fullName || 'N/A'),
+      'मोबाइल (Mobile)': sanitizeCsvCell(c.citizenId?.mobileNumber || 'N/A'),
+      'श्रेणी (Category)': sanitizeCsvCell(c.category),
+      'विषय (Subject)': sanitizeCsvCell(c.subject),
+      'प्राथमिकता (Priority)': sanitizeCsvCell(c.priority),
+      'स्थिति (Status)': sanitizeCsvCell(c.status),
+      'विधानसभा (Constituency)': sanitizeCsvCell(c.constituencyId?.name || 'N/A'),
+      'वार्ड (Ward)': sanitizeCsvCell(c.wardId?.wardNumber || 'N/A'),
+      'बूथ (Booth)': sanitizeCsvCell(c.boothId?.boothNumber || 'N/A'),
+      'आवंटित अधिकारी (Assigned To)': sanitizeCsvCell(c.assignedUserId?.fullName || 'N/A'),
+      'दर्ज करने की तिथि (Submitted Date)': c.createdAt ? new Date(c.createdAt).toLocaleDateString('en-IN') : '',
+      'निस्तारण विवरण / अस्वीकृति कारण (Resolution / Remarks)': sanitizeCsvCell(c.resolutionDetails || c.rejectionReason || '')
+    }));
 
-    const rows = complaints.map(c => [
-      sanitizeCsvCell(c.trackingId),
-      sanitizeCsvCell(c.citizenId?.fullName || 'N/A'),
-      sanitizeCsvCell(c.citizenId?.mobileNumber || 'N/A'),
-      sanitizeCsvCell(c.category),
-      sanitizeCsvCell(c.subject),
-      sanitizeCsvCell(c.priority),
-      sanitizeCsvCell(c.status),
-      sanitizeCsvCell(c.constituencyId?.name || 'N/A'),
-      sanitizeCsvCell(c.wardId?.wardNumber || 'N/A'),
-      sanitizeCsvCell(c.boothId?.boothNumber || 'N/A'),
-      sanitizeCsvCell(c.createdAt ? new Date(c.createdAt).toLocaleDateString('en-IN') : '')
-    ]);
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Complaints');
 
-    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\r\n');
+    if (String(format).toLowerCase() === 'xlsx') {
+      const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="jan-connect-complaints-${Date.now()}.xlsx"`);
+      return res.status(200).send(buffer);
+    }
 
+    const csvContent = XLSX.utils.sheet_to_csv(worksheet);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="jan-connect-complaints-${Date.now()}.csv"`);
-    return res.status(200).send('\uFEFF' + csvContent); // UTF-8 BOM for Excel support
+    return res.status(200).send('\uFEFF' + csvContent);
   } catch (error) {
-    return errorResponse(res, `CSV निर्यात में त्रुटि: ${error.message}`, 500);
+    return errorResponse(res, `शिकायत निर्यात में त्रुटि: ${error.message}`, 500);
   }
 }
 

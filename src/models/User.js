@@ -60,6 +60,17 @@ const userSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    designation: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    voterId: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
     preferredLanguage: {
       type: String,
       default: "HINDI",

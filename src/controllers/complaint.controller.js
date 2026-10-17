@@ -265,6 +265,13 @@ async function addComplaintUpdate(req, res) {
     let nextStatus = oldStatus;
 
     if (newStatus && isStaff) {
+      if (newStatus === 'REJECTED') {
+        const reason = (req.body.rejectionReason || updateText || '').trim();
+        if (!reason) {
+          return errorResponse(res, 'शिकायत अस्वीकृत करने का कारण अनिवार्य है।', 400);
+        }
+        complaint.rejectionReason = reason;
+      }
       nextStatus = newStatus;
       complaint.status = newStatus;
       if (newStatus === 'RESOLVED') {
