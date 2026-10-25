@@ -18,6 +18,13 @@ router.get(
   userController.exportUsers
 );
 
+router.post(
+  '/export',
+  authenticate,
+  requireRoles('SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF'),
+  userController.exportUsers
+);
+
 router.get(
   '/import/template',
   authenticate,
@@ -72,6 +79,13 @@ router.patch(
   '/:id',
   authenticate,
   userController.updateUser
+);
+
+router.patch(
+  '/:id/verify',
+  authenticate,
+  requireRoles('SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF'),
+  userController.verifyUser
 );
 
 router.patch(

@@ -15,6 +15,8 @@ const notificationRoutes = require('./notification.routes');
 const uploadRoutes = require('./upload.routes');
 const reportRoutes = require('./report.routes');
 const auditRoutes = require('./audit.routes');
+const designationRoutes = require('./designation.routes');
+const directoryRoutes = require('./directory.routes');
 
 const mongoose = require('mongoose');
 
@@ -35,6 +37,8 @@ router.get('/health', (req, res) => {
 router.use('/auth', authRoutes);
 router.use('/users', userRoutes);
 router.use('/geography', geographyRoutes);
+router.use('/designations', designationRoutes);
+router.use('/directory', directoryRoutes);
 router.use('/complaints', complaintRoutes);
 router.use('/tasks', taskRoutes);
 router.use('/attendance', attendanceRoutes);

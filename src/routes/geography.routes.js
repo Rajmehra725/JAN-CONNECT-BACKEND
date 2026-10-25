@@ -5,6 +5,8 @@ const { authenticate } = require('../middleware/auth.middleware');
 const { requireRoles } = require('../middleware/rbac.middleware');
 
 // Public read endpoints
+router.get('/hierarchy', geoController.getHierarchy);
+router.get('/summary', geoController.getGeographySummary);
 router.get('/constituencies', geoController.getConstituencies);
 router.get('/wards', geoController.getWards);
 router.get('/booths', geoController.getBooths);

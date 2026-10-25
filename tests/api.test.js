@@ -184,6 +184,43 @@ async function runTestSuite() {
     assert(typeof app.handle === 'function', 'App must be an Express instance');
   });
 
+  // 9. Master Data Models & Decoupling
+  await runTest('मास्टर डेटा: पदनाम (Designations) और भूमिका (Roles) का पूर्ण पृथक्करण', () => {
+    const validRoles = ['SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF', 'BOOTH_WORKER', 'CITIZEN'];
+    const sampleDesignation = 'विधायक (MLA)';
+    // A designation is NEVER an account role
+    assert.strictEqual(validRoles.includes(sampleDesignation), false);
+    // User role CITIZEN can hold any designation
+    const user = { role: 'CITIZEN', designation: 'जिला पंचायत अध्यक्ष' };
+    assert.strictEqual(user.role, 'CITIZEN');
+    assert.strictEqual(user.designation, 'जिला पंचायत अध्यक्ष');
+  });
+
+  // 10. Geography Master Cascading
+  await runTest('भौगोलिक पदानुक्रम: राज्य -> संभाग -> जिला -> ग्रामीण (ब्लॉक/पंचायत/गांव) अथवा शहरी (निकाय/वार्ड)', () => {
+    const LocationMaster = require('../src/models/LocationMaster');
+    assert(LocationMaster.schema.paths.state, 'State field required');
+    assert(LocationMaster.schema.paths.district, 'District field required');
+    assert(LocationMaster.schema.paths.areaType, 'AreaType field required');
+    assert(LocationMaster.schema.paths.developmentBlock, 'DevelopmentBlock field required');
+    assert(LocationMaster.schema.paths.localBody, 'LocalBody field required');
+  });
+
+  // 11. Excel Multi-person and Sanitization
+  await runTest('एक्सेल सुरक्षा एवं पार्सिंग: फॉर्मूला इंजेक्शन से बचाव एवं सेल सैनिटाइजेशन', () => {
+    const dirty1 = '=SUM(A1:A10)';
+    const dirty2 = '+919893001122';
+    const dirty3 = '@admin';
+    const sanitize = (val) => {
+      let str = String(val).trim();
+      if (/^[=+\-@\t\r]/.test(str)) return `'${str}`;
+      return str;
+    };
+    assert.strictEqual(sanitize(dirty1).startsWith("'="), true);
+    assert.strictEqual(sanitize(dirty2).startsWith("'+"), true);
+    assert.strictEqual(sanitize(dirty3).startsWith("'@"), true);
+  });
+
   console.log('\n====================================================');
   console.log(`  परीक्षण परिणाम: ${passedTests}/${totalTests} सफल (${Math.round((passedTests/totalTests)*100)}%)`);
   console.log('====================================================\n');

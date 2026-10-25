@@ -65,6 +65,53 @@ const userSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    designationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Designation",
+      default: null,
+      index: true,
+    },
+    designationCategory: {
+      type: String,
+      enum: ["ELECTED_REPRESENTATIVE", "ADMINISTRATIVE_OFFICIAL", "DEPARTMENTAL_OFFICIAL", "OTHER", ""],
+      default: "",
+      index: true,
+    },
+    departmentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Department",
+      default: null,
+      index: true,
+    },
+    department: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    officialEmail: {
+      type: String,
+      trim: true,
+      lowercase: true,
+    },
+    officeAddress: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    officeContact: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    termStartDate: {
+      type: Date,
+      default: null,
+    },
+    termEndDate: {
+      type: Date,
+      default: null,
+    },
     voterId: {
       type: String,
       trim: true,
@@ -100,6 +147,77 @@ const userSchema = new mongoose.Schema(
       index: true,
       default: null,
     },
+    // Hierarchical Geographical Fields
+    state: {
+      type: String,
+      default: "Madhya Pradesh",
+      trim: true,
+      index: true,
+    },
+    division: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    district: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    assemblyConstituency: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    parliamentaryConstituency: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    areaType: {
+      type: String,
+      enum: ["RURAL", "URBAN", "ALL", ""],
+      default: "",
+      index: true,
+    },
+    tehsil: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    developmentBlock: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    localBodyType: {
+      type: String,
+      default: "",
+    },
+    localBody: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    gramPanchayat: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    village: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
     // Address Details
     address: {
       type: String,
@@ -112,16 +230,14 @@ const userSchema = new mongoose.Schema(
     wardNumber: {
       type: String,
       trim: true,
+      index: true,
+    },
+    wardName: {
+      type: String,
+      trim: true,
+      default: "",
     },
     boothNumber: {
-      type: String,
-      trim: true,
-    },
-    district: {
-      type: String,
-      trim: true,
-    },
-    assemblyConstituency: {
       type: String,
       trim: true,
     },
@@ -140,6 +256,37 @@ const userSchema = new mongoose.Schema(
     emergencyContact: {
       type: String,
       trim: true,
+    },
+    // Record & Verification Management
+    verificationStatus: {
+      type: String,
+      enum: ["UNVERIFIED", "PENDING_REVIEW", "VERIFIED", "REJECTED"],
+      default: "UNVERIFIED",
+      index: true,
+    },
+    verifiedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    verifiedAt: {
+      type: Date,
+      default: null,
+    },
+    verificationNotes: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    sourceOfInformation: {
+      type: String,
+      trim: true,
+      default: "MANUAL_ENTRY",
+    },
+    isPublicDirectoryVisible: {
+      type: Boolean,
+      default: true,
+      index: true,
     },
     lastLoginAt: {
       type: Date,
