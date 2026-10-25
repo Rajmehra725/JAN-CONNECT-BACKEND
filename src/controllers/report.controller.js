@@ -1,8 +1,11 @@
 const XLSX = require('xlsx');
+const mongoose = require('mongoose');
 const Complaint = require('../models/Complaint');
 const User = require('../models/User');
 const Task = require('../models/Task');
 const Attendance = require('../models/Attendance');
+const AuditLog = require('../models/AuditLog');
+const BotQueryLog = require('../models/BotQueryLog');
 const { successResponse, errorResponse } = require('../utils/response');
 const { buildScopeFilter } = require('../middleware/scope.middleware');
 
@@ -24,9 +27,24 @@ function sanitizeCsvCell(value) {
  */
 async function getDashboardSummary(req, res) {
   try {
+    const { startDate, endDate, district, designation } = req.query;
+
     const scopeFilter = buildScopeFilter(req.user);
+    let userFilter = buildScopeFilter(req.user, { isUserQuery: true });
+
+    // Optional district & designation filters
+    if (district && district !== 'ALL') {
+      userFilter.district = new RegExp(`^${district.trim()}$`, 'i');
+    }
+    if (designation && designation !== 'ALL') {
+      userFilter.designation = new RegExp(`^${designation.trim()}$`, 'i');
+    }
+
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
+
+    const fifteenDaysAgo = new Date();
+    fifteenDaysAgo.setDate(fifteenDaysAgo.getDate() - 15);
 
     // Complaint aggregation
     const [
@@ -36,7 +54,8 @@ async function getDashboardSummary(req, res) {
       submittedComplaints,
       rejectedComplaints,
       urgentComplaints,
-      todayComplaints
+      todayComplaints,
+      overdueComplaints
     ] = await Promise.all([
       Complaint.countDocuments(scopeFilter),
       Complaint.countDocuments({ ...scopeFilter, status: 'RESOLVED' }),
@@ -44,12 +63,11 @@ async function getDashboardSummary(req, res) {
       Complaint.countDocuments({ ...scopeFilter, status: 'SUBMITTED' }),
       Complaint.countDocuments({ ...scopeFilter, status: 'REJECTED' }),
       Complaint.countDocuments({ ...scopeFilter, priority: 'URGENT', status: { $ne: 'RESOLVED' } }),
-      Complaint.countDocuments({ ...scopeFilter, createdAt: { $gte: startOfToday } })
+      Complaint.countDocuments({ ...scopeFilter, createdAt: { $gte: startOfToday } }),
+      Complaint.countDocuments({ ...scopeFilter, status: { $nin: ['RESOLVED', 'REJECTED'] }, createdAt: { $lte: fifteenDaysAgo } })
     ]);
 
     // User aggregation
-    let userFilter = buildScopeFilter(req.user, { isUserQuery: true });
-
     const [
       totalUsers,
       totalCitizens,
@@ -57,7 +75,18 @@ async function getDashboardSummary(req, res) {
       totalStaff,
       totalPoliticians,
       totalSuperAdmins,
-      todayRegistrations
+      todayRegistrations,
+      activeUsers,
+      suspendedUsers,
+      deactivatedUsers,
+      pendingUsers,
+      verifiedUsers,
+      unverifiedUsers,
+      pendingReviewUsers,
+      rejectedUsers,
+      missingDesignationUsers,
+      missingLocationUsers,
+      incompleteContactUsers
     ] = await Promise.all([
       User.countDocuments(userFilter),
       User.countDocuments({ ...userFilter, role: 'CITIZEN' }),
@@ -65,8 +94,60 @@ async function getDashboardSummary(req, res) {
       User.countDocuments({ ...userFilter, role: 'PA_STAFF' }),
       User.countDocuments({ ...userFilter, role: 'POLITICIAN' }),
       User.countDocuments({ ...userFilter, role: 'SUPER_ADMIN' }),
-      User.countDocuments({ ...userFilter, createdAt: { $gte: startOfToday } })
+      User.countDocuments({ ...userFilter, createdAt: { $gte: startOfToday } }),
+      User.countDocuments({ ...userFilter, accountStatus: 'ACTIVE' }),
+      User.countDocuments({ ...userFilter, accountStatus: 'SUSPENDED' }),
+      User.countDocuments({ ...userFilter, accountStatus: 'DEACTIVATED' }),
+      User.countDocuments({ ...userFilter, accountStatus: 'PENDING' }),
+      User.countDocuments({ ...userFilter, verificationStatus: 'VERIFIED' }),
+      User.countDocuments({ ...userFilter, verificationStatus: 'UNVERIFIED' }),
+      User.countDocuments({ ...userFilter, verificationStatus: 'PENDING_REVIEW' }),
+      User.countDocuments({ ...userFilter, verificationStatus: 'REJECTED' }),
+      User.countDocuments({ ...userFilter, $or: [{ designation: { $exists: false } }, { designation: '' }, { designation: null }] }),
+      User.countDocuments({ ...userFilter, $or: [{ district: { $exists: false } }, { district: '' }, { district: null }] }),
+      User.countDocuments({ ...userFilter, $or: [{ email: { $exists: false } }, { email: '' }, { email: null }] })
     ]);
+
+    // Optional period registrations if date range passed
+    let periodRegistrations = todayRegistrations;
+    if (startDate && endDate) {
+      const s = new Date(startDate);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
+      periodRegistrations = await User.countDocuments({ ...userFilter, createdAt: { $gte: s, $lte: e } });
+    }
+
+    // Top Designations breakdown
+    const designationBreakdown = await User.aggregate([
+      { $match: { ...userFilter, designation: { $nin: ['', null] } } },
+      { $group: { _id: '$designation', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 6 }
+    ]);
+
+    // Top Districts breakdown
+    const districtBreakdown = await User.aggregate([
+      { $match: { ...userFilter, district: { $nin: ['', null] } } },
+      { $group: { _id: '$district', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 6 }
+    ]);
+
+    // Area Type breakdown
+    const [ruralCount, urbanCount] = await Promise.all([
+      User.countDocuments({ ...userFilter, areaType: 'RURAL' }),
+      User.countDocuments({ ...userFilter, areaType: 'URBAN' })
+    ]);
+
+    // Bot query logs stats
+    let botStats = { totalQueries: 0, unansweredCount: 0 };
+    try {
+      const [totalBot, unansweredBot] = await Promise.all([
+        BotQueryLog.countDocuments(),
+        BotQueryLog.countDocuments({ status: 'UNANSWERED' })
+      ]);
+      botStats = { totalQueries: totalBot, unansweredCount: unansweredBot };
+    } catch (_) {}
 
     // Task aggregation
     let taskFilter = {};
@@ -88,7 +169,7 @@ async function getDashboardSummary(req, res) {
 
     // Recent 5 member registrations
     const recentMembers = await User.find(userFilter)
-      .select('fullName mobileNumber role accountStatus createdAt designation district assemblyConstituency')
+      .select('fullName mobileNumber role accountStatus createdAt designation district assemblyConstituency verificationStatus')
       .sort({ createdAt: -1 })
       .limit(5);
 
@@ -98,6 +179,16 @@ async function getDashboardSummary(req, res) {
       .select('trackingId subject category priority status createdAt')
       .sort({ createdAt: -1 })
       .limit(5);
+
+    // Recent 5 audit activity logs
+    let recentActivity = [];
+    try {
+      recentActivity = await AuditLog.find()
+        .populate('userId', 'fullName mobileNumber role')
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean();
+    } catch (_) {}
 
     // 7-day activity trend for charts
     const trend = [];
@@ -122,8 +213,14 @@ async function getDashboardSummary(req, res) {
     }
 
     const resolutionRate = totalComplaints > 0 ? Math.round((resolvedComplaints / totalComplaints) * 100) : 0;
+    const dbConnected = mongoose.connection.readyState === 1;
 
     return successResponse(res, {
+      systemHealth: {
+        database: dbConnected ? 'CONNECTED' : 'DISCONNECTED',
+        apiStatus: 'HEALTHY',
+        timestamp: new Date().toISOString()
+      },
       complaints: {
         total: totalComplaints,
         submitted: submittedComplaints,
@@ -131,6 +228,7 @@ async function getDashboardSummary(req, res) {
         resolved: resolvedComplaints,
         rejected: rejectedComplaints,
         urgent: urgentComplaints,
+        overdue: overdueComplaints,
         todayComplaints,
         resolutionRate
       },
@@ -141,8 +239,29 @@ async function getDashboardSummary(req, res) {
         staff: totalStaff,
         politicians: totalPoliticians,
         superAdmins: totalSuperAdmins,
-        todayRegistrations
+        todayRegistrations,
+        periodRegistrations,
+        active: activeUsers,
+        suspended: suspendedUsers,
+        deactivated: deactivatedUsers,
+        pending: pendingUsers,
+        verified: verifiedUsers,
+        unverified: unverifiedUsers,
+        pendingReview: pendingReviewUsers,
+        rejected: rejectedUsers,
+        missingDesignation: missingDesignationUsers,
+        missingLocation: missingLocationUsers,
+        incompleteContact: incompleteContactUsers
       },
+      distribution: {
+        byDesignation: designationBreakdown.map(d => ({ title: d._id, count: d.count })),
+        byDistrict: districtBreakdown.map(d => ({ district: d._id, count: d.count })),
+        byArea: {
+          rural: ruralCount,
+          urban: urbanCount
+        }
+      },
+      botStats,
       tasks: {
         total: totalTasks,
         completed: completedTasks,
@@ -151,6 +270,7 @@ async function getDashboardSummary(req, res) {
       todayAttendance: todayAttendanceCount,
       recentMembers: recentMembers.map(u => u.toJSON()),
       recentComplaints,
+      recentActivity,
       trend
     }, 'डैशबोर्ड सांख्यिकी प्राप्त हुई।');
   } catch (error) {

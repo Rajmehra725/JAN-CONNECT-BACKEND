@@ -221,6 +221,66 @@ async function runTestSuite() {
     assert.strictEqual(sanitize(dirty3).startsWith("'@"), true);
   });
 
+  // 12. Smart FAQ Bot Matcher Tests
+  await runTest('स्मार्ट FAQ बॉट: भाषा पहचान और टोकनाइज़ेशन (Hindi & English)', () => {
+    const { detectLanguage, tokenize } = require('../src/utils/faqMatcher');
+    assert.strictEqual(detectLanguage('पोर्टल पर लॉगिन कैसे करें?'), 'HI');
+    assert.strictEqual(detectLanguage('How to lodge a complaint?'), 'EN');
+
+    const tokensHi = tokenize('पोर्टल पर लॉगिन कैसे करें?');
+    assert(tokensHi.includes('लॉगिन'), 'Must tokenize Hindi keyword लॉगिन');
+
+    const tokensEn = tokenize('How to lodge a complaint online?');
+    assert(tokensEn.includes('lodge') || tokensEn.includes('complaint'), 'Must tokenize English keywords');
+  });
+
+  await runTest('स्मार्ट FAQ बॉट: सटीक मिलान एवं विश्वास स्कोर (Confidence Score)', () => {
+    const { matchFaq } = require('../src/utils/faqMatcher');
+    const sampleFaqs = [
+      {
+        faqId: 'FAQ-01',
+        questionHi: 'लॉगिन कैसे करें?',
+        questionEn: 'How to login?',
+        answerHi: 'लॉगिन बटन पर क्लिक करें।',
+        answerEn: 'Click login button.',
+        keywords: ['लॉगिन', 'login', 'पासवर्ड'],
+        alternativePhrases: ['लॉगिन करने का तरीका']
+      },
+      {
+        faqId: 'FAQ-02',
+        questionHi: 'शिकायत कैसे दर्ज करें?',
+        questionEn: 'How to file a complaint?',
+        answerHi: 'डैशबोर्ड में शिकायत विकल्प चुनें।',
+        answerEn: 'Choose complaint option in dashboard.',
+        keywords: ['शिकायत', 'complaint', 'समस्या'],
+        alternativePhrases: ['शिकायत दर्ज करने की प्रक्रिया']
+      }
+    ];
+
+    // Direct Hindi match
+    const r1 = matchFaq('मुझे शिकायत करनी है', sampleFaqs);
+    assert.strictEqual(r1.status, 'ANSWERED');
+    assert.strictEqual(r1.matchedFaq.faqId, 'FAQ-02');
+
+    // Direct English match
+    const r2 = matchFaq('how do I login to the portal', sampleFaqs);
+    assert.strictEqual(r2.status, 'ANSWERED');
+    assert.strictEqual(r2.matchedFaq.faqId, 'FAQ-01');
+
+    // Unknown fallback
+    const r3 = matchFaq('चांद पर जाने का टिकट कितने का है?', sampleFaqs);
+    assert.strictEqual(r3.status, 'UNANSWERED');
+    assert.strictEqual(r3.matchedFaq, null);
+  });
+
+  // 13. Soft Delete and Recovery Schema
+  await runTest('डेटा रिकवरी: यूजर स्कीमा में isDeleted और रिकवरी फील्ड्स उपस्थित होने चाहिए', () => {
+    const User = require('../src/models/User');
+    assert(User.schema.paths.isDeleted, 'isDeleted path must exist');
+    assert(User.schema.paths.deletedAt, 'deletedAt path must exist');
+    assert(User.schema.paths.deletedBy, 'deletedBy path must exist');
+  });
+
   console.log('\n====================================================');
   console.log(`  परीक्षण परिणाम: ${passedTests}/${totalTests} सफल (${Math.round((passedTests/totalTests)*100)}%)`);
   console.log('====================================================\n');

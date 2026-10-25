@@ -17,6 +17,8 @@ const reportRoutes = require('./report.routes');
 const auditRoutes = require('./audit.routes');
 const designationRoutes = require('./designation.routes');
 const directoryRoutes = require('./directory.routes');
+const faqRoutes = require('./faq.routes');
+const faqController = require('../controllers/faq.controller');
 
 const mongoose = require('mongoose');
 
@@ -50,5 +52,10 @@ router.use('/notifications', notificationRoutes);
 router.use('/uploads', uploadRoutes);
 router.use('/reports', reportRoutes);
 router.use('/audit', auditRoutes);
+router.use('/faqs', faqRoutes);
+
+// Public Smart Jan Connect Bot Endpoints
+router.post('/bot/ask', faqController.askBot);
+router.get('/bot/faqs', faqController.getPublicFaqs);
 
 module.exports = router;

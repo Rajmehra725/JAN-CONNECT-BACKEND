@@ -15,7 +15,7 @@ async function getAuditLogs(req, res) {
     const [logs, total] = await Promise.all([
       AuditLog.find(filter)
         .populate('userId', 'fullName mobileNumber role')
-        .sort({ timestamp: -1 })
+        .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum),
       AuditLog.countDocuments(filter)

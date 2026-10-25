@@ -1,7 +1,7 @@
 const mongoose = require("mongoose");
 
 const ROLES = ["SUPER_ADMIN", "POLITICIAN", "PA_STAFF", "BOOTH_WORKER", "CITIZEN"];
-const ACCOUNT_STATUSES = ["ACTIVE", "SUSPENDED", "DEACTIVATED"];
+const ACCOUNT_STATUSES = ["ACTIVE", "SUSPENDED", "DEACTIVATED", "PENDING"];
 
 const userSchema = new mongoose.Schema(
   {
@@ -293,6 +293,20 @@ const userSchema = new mongoose.Schema(
       default: null,
     },
     createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    isDeleted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    deletedAt: {
+      type: Date,
+      default: null,
+    },
+    deletedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       default: null,

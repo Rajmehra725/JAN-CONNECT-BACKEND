@@ -826,6 +826,9 @@ async function deleteUser(req, res) {
     // If user has existing records or hardDelete is not explicitly requested by Super Admin, soft-deactivate
     if (complaintCount > 0 || String(hardDelete) !== 'true' || req.user.role !== 'SUPER_ADMIN') {
       user.accountStatus = 'DEACTIVATED';
+      user.isDeleted = true;
+      user.deletedAt = new Date();
+      user.deletedBy = req.user._id;
       await user.save();
 
       await logAudit({
@@ -862,6 +865,44 @@ async function deleteUser(req, res) {
     return successResponse(res, { deleted: true }, 'उपयोगकर्ता खाता डेटाबेस से सफलतापूर्वक हटा दिया गया है।');
   } catch (error) {
     return errorResponse(res, `उपयोगकर्ता हटाने में त्रुटि: ${error.message}`, 500);
+  }
+}
+
+/**
+ * PATCH /api/v1/users/:id/restore
+ * Restore soft-deleted / deactivated user account
+ */
+async function restoreUser(req, res) {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return errorResponse(res, 'उपयोगकर्ता नहीं मिला।', 404);
+    }
+
+    user.accountStatus = 'ACTIVE';
+    user.isDeleted = false;
+    user.deletedAt = null;
+    user.deletedBy = null;
+    await user.save();
+
+    await logAudit({
+      userId: req.user._id,
+      userRole: req.user.role,
+      action: 'USER_RESTORE',
+      resourceType: 'User',
+      resourceId: user._id,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent'),
+      details: { restoredMobile: user.mobileNumber, role: user.role }
+    });
+
+    return successResponse(
+      res,
+      { user: user.toJSON(), restored: true },
+      'उपयोगकर्ता खाता सफलतापूर्वक पुनः सक्रिय (Restored) कर दिया गया है।'
+    );
+  } catch (error) {
+    return errorResponse(res, `खाता पुनर्प्राप्ति में त्रुटि: ${error.message}`, 500);
   }
 }
 
@@ -1527,6 +1568,7 @@ module.exports = {
   verifyUser,
   updateAccountStatus,
   deleteUser,
+  restoreUser,
   exportUsers,
   getImportTemplate,
   previewImport,

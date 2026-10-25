@@ -95,6 +95,13 @@ router.patch(
   userController.updateAccountStatus
 );
 
+router.patch(
+  '/:id/restore',
+  authenticate,
+  requireRoles('SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF'),
+  userController.restoreUser
+);
+
 router.delete(
   '/:id',
   authenticate,
