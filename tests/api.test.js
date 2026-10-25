@@ -281,6 +281,77 @@ async function runTestSuite() {
     assert(User.schema.paths.deletedBy, 'deletedBy path must exist');
   });
 
+  // 14. Universal Auto-Import: Column Detection & Multi-Person Rows
+  await runTest('यूनिवर्सल ऑटो-इम्पोर्ट: हिंदी/अंग्रेजी हेडर पहचान एवं 2-कॉलम फॉलबैक', () => {
+    const { detectColumnsAndMultiPerson } = require('../src/utils/columnDetector');
+    const headers = ['सदस्य का नाम', 'मोबाइल नंबर', 'पद', 'जिला'];
+    const d = detectColumnsAndMultiPerson(headers);
+    assert.strictEqual(d.standardMapping.nameCol, 'सदस्य का नाम');
+    assert.strictEqual(d.standardMapping.phoneCol, 'मोबाइल नंबर');
+    assert.strictEqual(d.standardMapping.designationCol, 'पद');
+    assert.strictEqual(d.standardMapping.districtCol, 'जिला');
+    assert.strictEqual(d.isMultiPerson, false);
+  });
+
+  await runTest('यूनिवर्सल ऑटो-इम्पोर्ट: बहु-व्यक्ति पंचायत पंक्तियों का पृथक्करण (सरपंच, सचिव, रोजगार सहायक)', () => {
+    const { detectColumnsAndMultiPerson, expandRowsToCandidates } = require('../src/utils/columnDetector');
+    const headers = [
+      'जिला', 'विकासखंड', 'ग्राम पंचायत',
+      'सरपंच का नाम', 'सरपंच का मोबाइल नंबर',
+      'सचिव का नाम', 'सचिव का मोबाइल नंबर',
+      'रोजगार सहायक का नाम', 'रोजगार सहायक का मोबाइल नंबर'
+    ];
+    const d = detectColumnsAndMultiPerson(headers);
+    assert.strictEqual(d.isMultiPerson, true, 'Multi-person mode must be detected');
+    assert.strictEqual(d.multiPersonPairs.length, 3, 'Must detect 3 distinct role pairs');
+
+    const sampleRows = [{
+      'जिला': 'रीवा',
+      'विकासखंड': 'रायपुर',
+      'ग्राम पंचायत': 'बरहदी',
+      'सरपंच का नाम': 'रामलखन पटेल',
+      'सरपंच का मोबाइल नंबर': '9893011111',
+      'सचिव का नाम': 'कमलेश शर्मा',
+      'सचिव का मोबाइल नंबर': '9893022222',
+      'रोजगार सहायक का नाम': 'दिलीप सिंह',
+      'रोजगार सहायक का मोबाइल नंबर': '9893033333'
+    }];
+
+    const candidates = expandRowsToCandidates(sampleRows, d);
+    assert.strictEqual(candidates.length, 3, 'One row must expand into 3 separate member records');
+    assert.strictEqual(candidates[0].fullName, 'रामलखन पटेल');
+    assert.strictEqual(candidates[0].rawMobile, '9893011111');
+    assert.strictEqual(candidates[0].designation, 'सरपंच (ग्राम पंचायत)');
+    assert.strictEqual(candidates[0].district, 'रीवा');
+    assert.strictEqual(candidates[0].gramPanchayat, 'बरहदी');
+
+    assert.strictEqual(candidates[1].fullName, 'कमलेश शर्मा');
+    assert.strictEqual(candidates[1].rawMobile, '9893022222');
+    assert.strictEqual(candidates[1].designation, 'ग्राम पंचायत सचिव');
+
+    assert.strictEqual(candidates[2].fullName, 'दिलीप सिंह');
+    assert.strictEqual(candidates[2].rawMobile, '9893033333');
+    assert.strictEqual(candidates[2].designation, 'ग्राम रोजगार सहायक (GRS)');
+  });
+
+  await runTest('यूनिवर्सल ऑटो-इम्पोर्ट: पदनाम मैपिंग एवं Mongoose Enum सुरक्षा (POLITICAL अस्वीकार/सुरक्षित)', () => {
+    const { matchDesignationToMaster } = require('../src/utils/columnDetector');
+    const mockMasters = [
+      { _id: 'd1', title: 'Gram Panchayat Sarpanch', titleHi: 'सरपंच (ग्राम पंचायत)', category: 'ELECTED_REPRESENTATIVE' },
+      { _id: 'd2', title: 'Gram Panchayat Secretary', titleHi: 'ग्राम पंचायत सचिव', category: 'ADMINISTRATIVE_OFFICIAL' }
+    ];
+
+    const m1 = matchDesignationToMaster('सरपंच', mockMasters);
+    assert.strictEqual(m1.title, 'सरपंच (ग्राम पंचायत)');
+    assert.strictEqual(m1.category, 'ELECTED_REPRESENTATIVE');
+    assert.strictEqual(m1.designationId, 'd1');
+
+    // Unknown designation fallback: must NEVER return 'POLITICAL'
+    const m2 = matchDesignationToMaster('अज्ञात नागरिक पद', mockMasters);
+    assert(['ELECTED_REPRESENTATIVE', 'ADMINISTRATIVE_OFFICIAL', 'DEPARTMENTAL_OFFICIAL', 'OTHER', ''].includes(m2.category), 'Category must be valid Mongoose enum');
+    assert.notStrictEqual(m2.category, 'POLITICAL', 'Category must never be invalid enum POLITICAL');
+  });
+
   console.log('\n====================================================');
   console.log(`  परीक्षण परिणाम: ${passedTests}/${totalTests} सफल (${Math.round((passedTests/totalTests)*100)}%)`);
   console.log('====================================================\n');

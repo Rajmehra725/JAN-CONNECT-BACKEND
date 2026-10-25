@@ -7,6 +7,11 @@ const { successResponse, errorResponse } = require('../utils/response');
 const { logAudit } = require('../services/audit.service');
 const { buildScopeFilter } = require('../middleware/scope.middleware');
 const { normalizePhoneNumber } = require('../utils/phone');
+const {
+  detectColumnsAndMultiPerson,
+  expandRowsToCandidates,
+  matchDesignationToMaster
+} = require('../utils/columnDetector');
 
 /**
  * Sanitize cell value to prevent CSV / Excel Formula Injection (CWE-1236)
@@ -1067,111 +1072,10 @@ async function getImportTemplate(req, res) {
 }
 
 /**
- * Helper to detect column mappings in arbitrary Excel sheet
- */
-function detectColumnMappings(headers, customMapping = {}) {
-  const mapping = {
-    nameCol: customMapping.nameCol || null,
-    phoneCol: customMapping.phoneCol || null,
-    roleCol: customMapping.roleCol || null,
-    designationCol: customMapping.designationCol || null,
-    categoryCol: customMapping.categoryCol || null,
-    departmentCol: customMapping.departmentCol || null,
-    districtCol: customMapping.districtCol || null,
-    areaTypeCol: customMapping.areaTypeCol || null,
-    blockCol: customMapping.blockCol || null,
-    tehsilCol: customMapping.tehsilCol || null,
-    panchayatCol: customMapping.panchayatCol || null,
-    villageCol: customMapping.villageCol || null,
-    localBodyCol: customMapping.localBodyCol || null,
-    wardCol: customMapping.wardCol || null,
-    constituencyCol: customMapping.constituencyCol || null,
-    addressCol: customMapping.addressCol || null,
-    voterIdCol: customMapping.voterIdCol || null
-  };
-
-  const dictionary = {
-    nameCol: ['name', 'fullname', 'full name', 'नाम', 'पूरा नाम', 'सदस्य नाम', 'सदस्य का नाम', 'member name', 'first name'],
-    phoneCol: ['phone', 'phonenumber', 'phone number', 'mobile', 'mobilenumber', 'mobile number', 'contact', 'contact number', 'मोबाइल', 'फ़ोन', 'फोन', 'मोबाइल नंबर', 'सम्पर्क', 'संपर्क', 'mobile no', 'phone no', 'contact no'],
-    roleCol: ['role', 'भूमिका', 'user role'],
-    designationCol: ['designation', 'पद', 'पदनाम', 'post', 'designation name'],
-    categoryCol: ['category', 'श्रेणी', 'वर्ग', 'designation category'],
-    departmentCol: ['department', 'विभाग', 'dept'],
-    districtCol: ['district', 'जिला', 'dist'],
-    areaTypeCol: ['area type', 'areatype', 'क्षेत्र प्रकार', 'क्षेत्र'],
-    blockCol: ['block', 'development block', 'विकासखंड', 'ब्लॉक'],
-    tehsilCol: ['tehsil', 'तहसील'],
-    panchayatCol: ['gram panchayat', 'grampanchayat', 'पंचायत', 'ग्राम पंचायत', 'panchayat'],
-    villageCol: ['village', 'गांव', 'ग्राम'],
-    localBodyCol: ['local body', 'localbody', 'ulb', 'नगर पालिका', 'नगर निगम', 'नगर परिषद', 'निकाय'],
-    wardCol: ['ward', 'ward number', 'ward no', 'वार्ड', 'वार्ड नंबर'],
-    constituencyCol: ['constituency', 'assembly', 'विधानसभा', 'विधानसभा क्षेत्र', 'ac'],
-    addressCol: ['address', 'पता', 'निवास'],
-    voterIdCol: ['voter id', 'voterid', 'epic', 'मतदाता पहचान']
-  };
-
-  for (const [key, candidates] of Object.entries(dictionary)) {
-    if (!mapping[key]) {
-      mapping[key] = headers.find(h => {
-        const clean = String(h).trim().toLowerCase().replace(/[^a-z0-9\u0900-\u097F]/g, '');
-        return candidates.some(c => clean === c.replace(/[^a-z0-9\u0900-\u097F]/g, ''));
-      }) || null;
-    }
-  }
-
-  // Fallback for simple 2-column sheets
-  if (headers.length === 2) {
-    if (!mapping.nameCol && !mapping.phoneCol) {
-      mapping.nameCol = headers[0];
-      mapping.phoneCol = headers[1];
-    } else if (!mapping.nameCol) {
-      mapping.nameCol = headers.find(h => h !== mapping.phoneCol) || headers[0];
-    } else if (!mapping.phoneCol) {
-      mapping.phoneCol = headers.find(h => h !== mapping.nameCol) || headers[1];
-    }
-  }
-
-  return mapping;
-}
-
-/**
- * Split multi-person rows if cell contains multiple names or phone numbers
- * e.g., "राम / श्याम" & "9893000001, 9893000002"
- */
-function expandMultiPersonRows(rawRows, nameCol, phoneCol) {
-  const expanded = [];
-
-  rawRows.forEach(row => {
-    const rawName = nameCol ? String(row[nameCol] || '').trim() : String(Object.values(row)[0] || '').trim();
-    const rawPhone = phoneCol ? String(row[phoneCol] || '').trim() : String(Object.values(row)[1] || '').trim();
-
-    // Check for delimiters: / , ; |
-    const splitRegex = /[\/;,|\n]+/;
-    const nameParts = rawName.split(splitRegex).map(s => s.trim()).filter(Boolean);
-    const phoneParts = rawPhone.split(splitRegex).map(s => s.trim()).filter(Boolean);
-
-    if (nameParts.length > 1 || phoneParts.length > 1) {
-      const count = Math.max(nameParts.length, phoneParts.length);
-      for (let i = 0; i < count; i++) {
-        const rowClone = { ...row };
-        const subName = nameParts[i] || nameParts[0] || rawName;
-        const subPhone = phoneParts[i] || phoneParts[0] || rawPhone;
-        if (nameCol) rowClone[nameCol] = subName;
-        if (phoneCol) rowClone[phoneCol] = subPhone;
-        expanded.push(rowClone);
-      }
-    } else {
-      expanded.push(row);
-    }
-  });
-
-  return expanded;
-}
-
-/**
  * POST /api/v1/users/import/preview
  * Validate and preview uploaded Excel / CSV rows with auto header detection,
- * manual column mapping, multi-person separation, in-file and DB duplicate identification.
+ * customizable column mapping, multi-person row expansion (e.g. Sarpanch, Secretary, GRS on one row),
+ * in-file and DB duplicate identification, and master designation linking.
  */
 async function previewImport(req, res) {
   try {
@@ -1180,10 +1084,13 @@ async function previewImport(req, res) {
     }
 
     const workbook = XLSX.read(req.file.buffer, { type: 'buffer', raw: false });
-    const sheetName = workbook.SheetNames[0];
-    if (!sheetName) {
+    const sheetNames = workbook.SheetNames || [];
+    if (sheetNames.length === 0) {
       return errorResponse(res, 'अपलोड की गई फाइल में कोई शीट नहीं मिली।', 400);
     }
+
+    const requestedSheet = req.body.sheetName || req.query.sheetName;
+    const sheetName = (requestedSheet && sheetNames.includes(requestedSheet)) ? requestedSheet : sheetNames[0];
 
     const worksheet = workbook.Sheets[sheetName];
     const initialRawRows = XLSX.utils.sheet_to_json(worksheet, { raw: false, defval: '' });
@@ -1192,21 +1099,38 @@ async function previewImport(req, res) {
     }
 
     const headers = Object.keys(initialRawRows[0] || {});
-    const customMapping = req.body || {};
-    const mapping = detectColumnMappings(headers, customMapping);
 
-    // Expand rows if multiple names / numbers were packaged into single cells
-    const rawRows = expandMultiPersonRows(initialRawRows, mapping.nameCol, mapping.phoneCol);
-
-    if (rawRows.length > 5000) {
-      return errorResponse(res, 'एक समय में अधिकतम 5000 पंक्तियों का पूर्वावलोकन समर्थित है।', 400);
+    // Parse custom mapping from FormData or JSON body
+    let customMapping = {};
+    if (req.body.mapping) {
+      try {
+        customMapping = typeof req.body.mapping === 'string' ? JSON.parse(req.body.mapping) : req.body.mapping;
+      } catch {
+        customMapping = {};
+      }
+    } else if (req.body) {
+      customMapping = req.body;
     }
+
+    // Auto-detect columns & check for multi-person column pairs
+    const detectionResult = detectColumnsAndMultiPerson(headers, customMapping);
+
+    // Expand rows to candidate member items (handles multi-person pairs & intra-cell delimiters)
+    const candidateRows = expandRowsToCandidates(initialRawRows, detectionResult, customMapping);
+
+    if (candidateRows.length > 5000) {
+      return errorResponse(res, 'एक समय में अधिकतम 5000 पंक्तियों का आयात समर्थित है।', 400);
+    }
+
+    // Pre-load active master designations for automatic linking
+    const masterDesignations = await Designation.find({ isActive: true })
+      .select('title titleHi category departmentId level')
+      .lean();
 
     // Extract all candidate phone numbers for batch database lookup
     const candidateMobiles = [];
-    rawRows.forEach(row => {
-      const rawVal = mapping.phoneCol ? row[mapping.phoneCol] : Object.values(row)[1];
-      const { isValid, normalized } = normalizePhoneNumber(rawVal);
+    candidateRows.forEach(row => {
+      const { isValid, normalized } = normalizePhoneNumber(row.rawMobile);
       if (isValid && !candidateMobiles.includes(normalized)) {
         candidateMobiles.push(normalized);
       }
@@ -1230,22 +1154,17 @@ async function previewImport(req, res) {
     const validatedRows = [];
     const errorList = [];
 
-    rawRows.forEach((row, idx) => {
-      const rowNum = idx + 2;
-
-      // Extract Name
-      const rawName = mapping.nameCol ? String(row[mapping.nameCol] || '').trim() : String(Object.values(row)[0] || '').trim();
-
-      // Extract Phone
-      const rawPhone = mapping.phoneCol ? row[mapping.phoneCol] : Object.values(row)[1];
-      const { isValid: isPhoneValid, normalized: cleanMobile, error: phoneErr } = normalizePhoneNumber(rawPhone);
-
+    candidateRows.forEach(c => {
+      const { isValid: isPhoneValid, normalized: cleanMobile, error: phoneErr } = normalizePhoneNumber(c.rawMobile);
       const rowErrors = [];
 
-      if (!rawName || rawName.length < 2) {
+      // Validate Name
+      const cleanName = c.fullName ? String(c.fullName).trim() : '';
+      if (!cleanName || cleanName.length < 2) {
         rowErrors.push('नाम अनिवार्य है (कम से कम 2 अक्षर)');
       }
 
+      // Validate Phone
       if (!isPhoneValid) {
         rowErrors.push(phoneErr || '10 अंकों का वैध भारतीय मोबाइल नंबर अनिवार्य है');
       }
@@ -1259,7 +1178,7 @@ async function previewImport(req, res) {
           duplicateOfRow = seenInFile.get(cleanMobile);
           rowErrors.push(`फाइल में दोहराया गया मोबाइल नंबर (पंक्ति ${duplicateOfRow} पर पहले से मौजूद)`);
         } else {
-          seenInFile.set(cleanMobile, rowNum);
+          seenInFile.set(cleanMobile, c.rowNumber);
         }
       }
 
@@ -1271,29 +1190,38 @@ async function previewImport(req, res) {
         existingRecord = existingMobileMap.get(cleanMobile);
       }
 
+      // Resolve designation against master data
+      const resolvedDesig = matchDesignationToMaster(c.designation, masterDesignations);
+
       const isValid = rowErrors.length === 0;
 
-      // Extract rich columns if available
       const parsedRow = {
-        rowNumber: rowNum,
-        fullName: rawName,
-        mobileNumber: cleanMobile || String(rawPhone || '').trim(),
-        rawMobile: String(rawPhone || ''),
-        role: (mapping.roleCol && row[mapping.roleCol]) ? String(row[mapping.roleCol]).trim().toUpperCase() : 'CITIZEN',
-        designation: mapping.designationCol ? String(row[mapping.designationCol] || '').trim() : '',
-        designationCategory: mapping.categoryCol ? String(row[mapping.categoryCol] || '').trim().toUpperCase() : 'POLITICAL',
-        department: mapping.departmentCol ? String(row[mapping.departmentCol] || '').trim() : '',
-        district: mapping.districtCol ? String(row[mapping.districtCol] || '').trim() : '',
-        areaType: mapping.areaTypeCol ? (String(row[mapping.areaTypeCol]).toUpperCase().includes('URBAN') || String(row[mapping.areaTypeCol]).includes('शहरी') ? 'URBAN' : 'RURAL') : 'RURAL',
-        tehsil: mapping.tehsilCol ? String(row[mapping.tehsilCol] || '').trim() : '',
-        developmentBlock: mapping.blockCol ? String(row[mapping.blockCol] || '').trim() : '',
-        gramPanchayat: mapping.panchayatCol ? String(row[mapping.panchayatCol] || '').trim() : '',
-        village: mapping.villageCol ? String(row[mapping.villageCol] || '').trim() : '',
-        localBody: mapping.localBodyCol ? String(row[mapping.localBodyCol] || '').trim() : '',
-        wardNumber: mapping.wardCol ? String(row[mapping.wardCol] || '').trim() : '',
-        assemblyConstituency: mapping.constituencyCol ? String(row[mapping.constituencyCol] || '').trim() : '',
-        address: mapping.addressCol ? String(row[mapping.addressCol] || '').trim() : '',
-        voterId: mapping.voterIdCol ? String(row[mapping.voterIdCol] || '').trim().toUpperCase() : '',
+        rowNumber: c.rowNumber,
+        personTag: c.personTag || '',
+        fullName: cleanName,
+        mobileNumber: cleanMobile || String(c.rawMobile || '').trim(),
+        rawMobile: String(c.rawMobile || ''),
+        role: ['SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF', 'BOOTH_WORKER'].includes(c.role) ? c.role : 'CITIZEN',
+        designation: resolvedDesig.title || c.designation || '',
+        designationId: resolvedDesig.designationId || null,
+        designationCategory: resolvedDesig.category || 'OTHER',
+        departmentId: resolvedDesig.departmentId || null,
+        department: c.department || '',
+        state: c.state || 'Madhya Pradesh',
+        district: c.district || '',
+        division: c.division || '',
+        areaType: c.areaType || 'RURAL',
+        tehsil: c.tehsil || '',
+        developmentBlock: c.developmentBlock || '',
+        gramPanchayat: c.gramPanchayat || '',
+        village: c.village || '',
+        localBody: c.localBody || '',
+        wardNumber: c.wardNumber || '',
+        wardName: c.wardName || '',
+        assemblyConstituency: c.assemblyConstituency || '',
+        parliamentaryConstituency: c.parliamentaryConstituency || '',
+        address: c.address || '',
+        voterId: c.voterId || '',
         isValid,
         isDuplicateInFile,
         duplicateOfRow,
@@ -1304,9 +1232,10 @@ async function previewImport(req, res) {
 
       if (!isValid || isExistingInDb) {
         errorList.push({
-          rowNumber: rowNum,
-          name: rawName,
-          mobile: cleanMobile || String(rawPhone || '').trim(),
+          rowNumber: c.rowNumber,
+          personTag: c.personTag || '',
+          name: cleanName,
+          mobile: cleanMobile || String(c.rawMobile || '').trim(),
           reason: isExistingInDb
             ? `डेटाबेस में पहले से पंजीकृत (${existingRecord?.fullName} - ${existingRecord?.role})`
             : rowErrors.join(', ')
@@ -1323,12 +1252,17 @@ async function previewImport(req, res) {
 
     return successResponse(res, {
       headers,
+      sheetNames,
+      selectedSheet: sheetName,
+      isMultiPerson: detectionResult.isMultiPerson,
+      multiPersonPairs: detectionResult.multiPersonPairs,
       detectedMapping: {
-        nameColumn: mapping.nameCol || headers[0] || 'Name',
-        phoneColumn: mapping.phoneCol || headers[1] || 'Phone Number',
-        ...mapping
+        nameColumn: detectionResult.standardMapping.nameCol || headers[0] || 'Name',
+        phoneColumn: detectionResult.standardMapping.phoneCol || headers[1] || 'Phone Number',
+        ...detectionResult.standardMapping
       },
-      totalRows: rawRows.length,
+      totalFileRows: initialRawRows.length,
+      totalRows: candidateRows.length,
       validRows: validRowsCount,
       duplicateInFileRows: duplicateInFileCount,
       existingInDbRows: existingInDbCount,
@@ -1354,7 +1288,7 @@ async function confirmImport(req, res) {
   try {
     const {
       rows,
-      importMode = 'CREATE_NEW' // 'CREATE_NEW' | 'UPDATE_EXISTING' | 'CREATE_OR_UPDATE' | 'SKIP_MATCHED'
+      importMode = 'CREATE_NEW'
     } = req.body;
 
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -1410,9 +1344,18 @@ async function confirmImport(req, res) {
               const userToUpdate = existingMobileMap.get(cleanMobile);
               if (r.fullName) userToUpdate.fullName = r.fullName.trim();
               if (r.designation) userToUpdate.designation = r.designation.trim();
-              if (r.designationCategory) userToUpdate.designationCategory = r.designationCategory;
+              if (r.designationId) userToUpdate.designationId = r.designationId;
+
+              // Enforce valid Mongoose designationCategory enum
+              const safeCat = ['ELECTED_REPRESENTATIVE', 'ADMINISTRATIVE_OFFICIAL', 'DEPARTMENTAL_OFFICIAL', 'OTHER'].includes(r.designationCategory)
+                ? r.designationCategory
+                : 'OTHER';
+              userToUpdate.designationCategory = safeCat;
+
               if (r.department) userToUpdate.department = r.department.trim();
+              if (r.departmentId) userToUpdate.departmentId = r.departmentId;
               if (r.district) userToUpdate.district = r.district.trim();
+              if (r.division) userToUpdate.division = r.division.trim();
               if (r.areaType) userToUpdate.areaType = r.areaType;
               if (r.tehsil) userToUpdate.tehsil = r.tehsil.trim();
               if (r.developmentBlock) userToUpdate.developmentBlock = r.developmentBlock.trim();
@@ -1420,7 +1363,9 @@ async function confirmImport(req, res) {
               if (r.village) userToUpdate.village = r.village.trim();
               if (r.localBody) userToUpdate.localBody = r.localBody.trim();
               if (r.wardNumber) userToUpdate.wardNumber = r.wardNumber.trim();
+              if (r.wardName) userToUpdate.wardName = r.wardName.trim();
               if (r.assemblyConstituency) userToUpdate.assemblyConstituency = r.assemblyConstituency.trim();
+              if (r.parliamentaryConstituency) userToUpdate.parliamentaryConstituency = r.parliamentaryConstituency.trim();
               if (r.address) userToUpdate.address = r.address.trim();
               if (r.voterId) userToUpdate.voterId = r.voterId.trim();
 
@@ -1452,6 +1397,11 @@ async function confirmImport(req, res) {
             continue;
           }
 
+          // Enforce valid Mongoose designationCategory enum
+          const safeCat = ['ELECTED_REPRESENTATIVE', 'ADMINISTRATIVE_OFFICIAL', 'DEPARTMENTAL_OFFICIAL', 'OTHER'].includes(r.designationCategory)
+            ? r.designationCategory
+            : 'OTHER';
+
           toInsert.push({
             fullName: r.fullName ? String(r.fullName).trim() : 'नागरिक',
             mobileNumber: cleanMobile,
@@ -1459,10 +1409,13 @@ async function confirmImport(req, res) {
             role: ['SUPER_ADMIN', 'POLITICIAN', 'PA_STAFF', 'BOOTH_WORKER'].includes(r.role) ? r.role : 'CITIZEN',
             accountStatus: 'ACTIVE',
             designation: r.designation ? r.designation.trim() : '',
-            designationCategory: r.designationCategory || 'POLITICAL',
+            designationId: r.designationId || null,
+            designationCategory: safeCat,
+            departmentId: r.departmentId || null,
             department: r.department ? r.department.trim() : '',
-            state: 'Madhya Pradesh',
+            state: r.state ? r.state.trim() : 'Madhya Pradesh',
             district: r.district ? r.district.trim() : '',
+            division: r.division ? r.division.trim() : '',
             areaType: r.areaType || 'RURAL',
             tehsil: r.tehsil ? r.tehsil.trim() : '',
             developmentBlock: r.developmentBlock ? r.developmentBlock.trim() : '',
@@ -1470,9 +1423,13 @@ async function confirmImport(req, res) {
             village: r.village ? r.village.trim() : '',
             localBody: r.localBody ? r.localBody.trim() : '',
             wardNumber: r.wardNumber ? r.wardNumber.trim() : '',
+            wardName: r.wardName ? r.wardName.trim() : '',
             assemblyConstituency: r.assemblyConstituency ? r.assemblyConstituency.trim() : '',
+            parliamentaryConstituency: r.parliamentaryConstituency ? r.parliamentaryConstituency.trim() : '',
             address: r.address ? r.address.trim() : '',
             voterId: r.voterId ? r.voterId.trim() : '',
+            isPublicDirectoryVisible: true,
+            isDeleted: false,
             sourceOfInformation: 'EXCEL_IMPORT',
             createdBy: req.user._id
           });
@@ -1484,22 +1441,34 @@ async function confirmImport(req, res) {
           const insertRes = await User.insertMany(toInsert, { ordered: false });
           createdCount += insertRes.length;
         } catch (err) {
+          if (err.insertedDocs && err.insertedDocs.length > 0) {
+            createdCount += err.insertedDocs.length;
+          }
           if (err.writeErrors) {
             createdCount += (toInsert.length - err.writeErrors.length);
             err.writeErrors.forEach(we => {
               failedCount++;
               failureList.push({
                 rowNumber: 0,
-                mobile: we.errmsg,
-                reason: 'डुप्लीकेट मोबाइल नंबर (E11000)'
+                mobile: we.errmsg || 'E11000',
+                reason: 'डुप्लीकेट मोबाइल नंबर (डेटाबेस में पहले से उपस्थित)'
               });
             });
           } else {
-            failedCount += toInsert.length;
-            failureList.push({
-              rowNumber: 0,
-              reason: err.message
-            });
+            // Resilient per-document fallback so schema errors don't drop the entire chunk
+            for (const item of toInsert) {
+              try {
+                await User.create(item);
+                createdCount++;
+              } catch (itemErr) {
+                failedCount++;
+                failureList.push({
+                  rowNumber: 0,
+                  mobile: item.mobileNumber,
+                  reason: itemErr.message
+                });
+              }
+            }
           }
         }
       }
@@ -1515,6 +1484,17 @@ async function confirmImport(req, res) {
       userAgent: req.get('user-agent'),
       details: { importMode, created: createdCount, updated: updatedCount, skipped: skippedCount, failed: failedCount }
     });
+
+    if (createdCount === 0 && updatedCount === 0 && failedCount > 0) {
+      return errorResponse(res, `आयात विफल: कोई भी सदस्य सहेजा नहीं जा सका (${failedCount} रिकॉर्ड त्रुटिपूर्ण रहे)।`, 400, {
+        totalProcessed: validRows.length,
+        createdCount,
+        updatedCount,
+        skippedCount,
+        failedCount,
+        failures: failureList
+      });
+    }
 
     return successResponse(res, {
       totalProcessed: validRows.length,
